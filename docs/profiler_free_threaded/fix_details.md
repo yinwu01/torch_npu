@@ -4,6 +4,11 @@
 - 基于 `113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
 - 修复提交：`663e8ba`（主体）、`f36d74d`（异常路径的引用泄漏）。
 - 本文写给要在原仓库解决这个问题的工程师。读完应能知道：问题在哪、我们怎么改、为什么这样改、验证到了什么程度、接手后要做什么。
+- 本文只讲这三个问题和对应修改。候选方案对比、与上游的逐项对照见 [analysis.md](analysis.md)；背景知识和过程经验见 [learning.md](learning.md)；进度和待办见 [progress.md](progress.md)。
+- **先看两件和线程无关的事。** 使用方崩溃的根因没有确定，三个候选中有两个在单线程、有 GIL 时同样成立：
+  - 本分支的基线缺少上游 `b2e659d62f`，在 CPython 3.13 及以上读取 `nn.Module` 帧的 `self` 会得到空指针，随后对空指针取属性（详见 [analysis.md](analysis.md) 第 4.2 节）；
+  - 上游 issue #5658 所述路径：原 `clear()` 在没有持有 GIL 的状态下 `Py_DECREF` `TraceContext`，调用方 `stopNpuProfiler()` 先执行了 `gil_scoped_release`。本分支的 `clear()` 已改为先取 GIL 再释放（见第 3 节问题 3）。
+  - 第三个候选是下面三处竞态中的某一处。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（[analysis.md](analysis.md) 第 1.5 节）。接手后先向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）和崩溃发生的时间点，再按第 7 节和 [analysis.md](analysis.md) 第 7.1 节的步骤处理。
 
 ## 1. 结论
 
@@ -15,7 +20,7 @@
   - 有 GIL 时，GIL 让多个 Python 线程基本依次执行，这些问题很少暴露；FT 下多个线程同时执行，就会暴露。
 - **与上游的关系**（2026-11-02 查看 `Ascend/pytorch` master）：
   - 问题 1、2：上游 master 的 `ring_buffer.h`、`data_dumper.cpp` 只改过代码格式，逻辑与 2.13.0 相同，问题仍在。
-  - 问题 3：上游在 `ff5ad88d8a`（2026-10-29，"profiler fix with_stack memory bug"）里重构了 `PythonTracer`，设计和我们不同，两者没有逐行比较。上游方案的要点：
+  - 问题 3：上游在 `ff5ad88d8a`（2026-10-29，"fix:profiler fix with_stack memory bug"）里重构了 `PythonTracer`，设计和我们不同。两者的逐项对照见 [analysis.md](analysis.md) 第 4.8 节。上游方案的要点：
     - 缓存和事件按线程存放在各自的 `ThreadLocalResult` 中，所有线程共用一个 ctx（`shared_ctx_`）；
     - `control_mutex_`、`report_mutex_` 和每个线程的 `callback_mutex_` 在两种构建中都启用，`results_mutex_` 只在 FT 下启用；
     - FT 且 CPython ≥ 3.14 时，直接调用 CPython 私有 API `_PyEval_StopTheWorld`/`_PyEval_StartTheWorld`。
@@ -195,7 +200,7 @@ Pop:
 - **回调不再访问 `ThreadLocalResult`。** `TraceContext` 中的 `thread_local_result_` 改为 `std::atomic<PythonTracer*> tracer_`，`~ThreadLocalResult` 会把它置空。回调只读取 ctx 和 tracer，不再访问 `ThreadLocalResult`。
 - **会话计数 `session_`。** `stop()` 在移除回调之前，在 `registration_mutex_` 内同时执行 `active_ = false` 和 `++session_`。原代码在移除回调之后才置 `active_ = false`。
 - **`startOne` 安装回调后再检查一次 `session_`。** 如果已经变化，说明 `stop()` 已经执行，就移除刚安装的回调；如果此时新会话已经开始，就重新注册一次（最多重试一次）。
-- **结果。** `stop()` 返回、且所有进行中的 `startOne` 都返回之后，没有线程仍安装着本 tracer 的回调。在此之前短暂存在的回调读到 `active_ == false`，不记录事件；ctx 由 `startOne` 持有的那份引用保证不会被提前释放。
+- **结果。** `stop()` 返回、且所有进行中的 `startOne` 都返回之后，没有线程仍安装着本 tracer 的回调。前提是 `sys.setprofile` 审计回调没有抛异常：按 `Python/legacy_tracing.c`，审计回调返回 -1 时 CPython 直接返回，不进入 stop-the-world，也不替换回调，只打印 unraisable 信息，此时旧回调仍装着：`stop()` 之后由 `active_ == false` 保证不记录事件，`clear()` 之后由 `tracer_` 已置空保证（`tracer_` 只在 `~ThreadLocalResult` 中置空，即 `clear()` 时；未测试）。在此之前短暂存在的回调读到 `active_ == false`，不记录事件；ctx 由 `startOne` 持有的那份引用保证不会被提前释放。
 - **其他：**
   - 回调的各记录函数（`genPyCallHashId`、`recordPyCall`、`recordCCall`、`recordReturn`）都新增了 `active_` 检查，`stop` 开始后不再记录。
   - `recordStartStack` 在会话已停止时丢弃记录。
@@ -229,15 +234,15 @@ Pop:
 
 **编译方式和运行次数：**
 
-- 三种编译方式：TSan（检测数据竞争）、ASan（检测越界、释放后访问、重复释放）、普通 `-O2`。
-- 每个场景重复 3 次。`rb` 场景在不同编译方式下使用不同的缓冲区容量：TSan 用 64 和 1024，ASan 用 64，普通构建用 64 和 4096。
-- 合计 TSan 15 次、ASan 12 次、普通构建 15 次，共 42 次场景运行。另有 7 次编译检查，包括一次有 GIL 路径的只编译检查，不计入下表。
+- 三种编译方式：TSan（检测数据竞争）、ASan（越界、释放后访问、重复释放；同一构建还开了 UBSan，即 UndefinedBehaviorSanitizer，`-fsanitize=address,undefined`，报告中含 `runtime error:`；以及 LeakSanitizer（LSan），Linux 上 ASan 构建默认开启，`run.py` 也设置了 `detect_leaks=1`）、plain（`-O2`，不带 sanitizer）。`run.py` 把这几种 sanitizer 的报告都判为失败，所以一次"ASan 构建失败"可能来自 ASan、UBSan 或 LSan。
+- 每个场景重复 3 次。`rb` 场景在不同编译方式下使用不同的缓冲区容量：TSan 用 64 和 1024，ASan 用 64，plain 构建用 64 和 4096。
+- 合计 TSan 15 次、ASan 12 次、plain 构建 15 次，共 42 次场景运行。另有 7 次编译检查，包括一次有 GIL 路径的只编译检查，不计入下表。
 
 ### 4.2 结果（2026-11-02，本机，同一套测试）
 
 | 被测代码 | 场景运行 | 失败 | 失败表现 |
 |---|---|---|---|
-| 原代码 `d3216c2` | 42 | 42 | TSan 数据竞争报告；ASan 报 heap-use-after-free 和 double-free；普通构建下 6 次 SIGSEGV、3 次 SIGABRT；`rb` 丢数据或顺序错乱；部分运行挂起直至超时 |
+| 原代码 `d3216c2` | 42 | 42 | TSan 数据竞争报告；ASan 报 heap-use-after-free 和 double-free；plain 构建下 6 次 SIGSEGV、3 次 SIGABRT；`rb` 丢数据或顺序错乱；部分运行挂起直至超时 |
 | 修复后 `f36d74d` | 42 | 0 | 无 |
 
 ### 4.3 复现
@@ -257,13 +262,16 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ### 4.4 审阅
 
-修改过程中做了四轮独立审阅。前两轮共提出 21 条意见：16 条修改了代码或测试，2 条更正了报告措辞，1 条在代码注释中说明（槽位内存增加），2 条只做了性能测量、没有改代码（`writers_` 计数开销、`with_stack` 锁争用，见第 5 节）。第三轮发现第二轮修复中的两处问题，已修复。其中几个问题是前一轮修复本身引入的：
+修改过程中做了三轮代码审阅，每轮两位审阅者。本文在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成 `docs/profiler_free_threaded/` 之后，与本目录其他四个文件一起又经过两轮文档审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工代码审阅。**
 
-- 两个线程同时 `Stop`；
-- `clear()` 重入导致死锁；
-- `startOne` 在 `stop()` 之后仍然安装回调。
+- **第一、二轮**共提出 21 条意见：16 条修改了代码或测试，2 条更正了报告措辞，1 条在代码注释中说明（槽位内存增加），2 条只做了性能测量、没有改代码（`writers_` 计数开销、`with_stack` 锁争用，见第 5 节）。其中几个问题是前一轮修复本身引入的：
+  - 两个线程同时 `Stop`；
+  - `clear()` 重入导致死锁；
+  - `startOne` 在 `stop()` 之后仍然安装回调。
+- **第二轮的修复过程中**，修复者用加强后的测试自己发现了两处问题（`session_` 的第一版没有同时提前置 `active_ = false`；`recordReturn` 在等锁之后才读 ctx），已修复。这两处的发现者是第二轮修复者本人。
+- **第三轮（最终审阅）**两位审阅者都判定没有严重或重要问题；其中确认的一处引用泄漏已在 `f36d74d` 修复，其余轻微问题写入了代码注释或本文第 6 节。
 
-第四轮两位审阅者都判定没有严重或重要问题；其中确认的一处引用泄漏已在 `f36d74d` 修复，其余轻微问题写入了代码注释或本文第 6 节。
+本节在整理文档目录时按审阅记录中的标签重新核对过：代码审阅标签为 `review:concurrency`、`review:integration`（第一轮），`review:concurrency:r2`、`review:integration:r2`（第二轮），`final:tracer`、`final:upload`（第三轮）。审阅记录未公开。原文写的"四轮独立审阅""第三轮发现第二轮修复中的两处问题"与记录不符，已按上面改写。逐条经过见 [learning.md](learning.md) B1、B5。
 
 ### 4.5 测试覆盖不到的内容
 
@@ -287,7 +295,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 | 变化 | 原因 |
 |---|---|
-| 采集期间每次上报多两次原子读-改-写操作（`writers_` 加 1、减 1） | 问题 1 的登记计数。`writers_` 是所有写入线程共用的一个计数器，多线程上报时这两次操作会在同一 cache line 上争用；已用 `alignas(64)` 与 `start_` 分开存放 |
+| 采集期间每次上报多两次原子读-改-写操作（`writers_` 加 1、减 1） | 问题 1 的登记计数。`writers_` 是所有写入线程共用的一个计数器，多线程上报时这两次操作会在同一缓存行上争用；已用 `alignas(64)` 与 `start_` 分开存放 |
 | 缓冲区每个槽位从 8 字节变为 16 字节；两个 2^20 槽位的缓冲区合计从 16 MB 增至 32 MB | 问题 2 的槽位序号 |
 | 缓冲区可用容量从 capacity-1 变为 capacity；非 2 的幂的容量会被向上取整 | 新队列的写法 |
 | 采集运行中调用 `Init`：记一条错误日志，先停止并把数据写完到旧路径，再按新路径初始化（原代码直接在运行中的缓冲区上重新分配） | 避免在写入方仍在访问时重新分配缓冲区 |
@@ -299,14 +307,15 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 |---|---|
 | 停止采集时，清除所有线程的 profile 函数，包括其他工具（如 cProfile）设置的 | FT 下无法安全读取其他正在运行的线程当前安装的回调，只能用 `PyEval_SetProfileAllThreads` 在 stop-the-world 期间统一清除 |
 | 启动时只记录当前线程已有的调用栈，不应用 `max_threads` | 同上，FT 下不能切换到其他正在运行的线程去遍历它的调用栈 |
-| 开启 `with_stack` 时 Python 调用变慢，线程越多越明显 | 每次 Python 调用至少获取两次 `data_mutex_`（`genPyCallHashId`、`recordPyCall` 各一次）。stub 环境中测回调吞吐（2026-11-02，多次运行的范围）：1 个线程每秒 420 万到 470 万次，6 个线程合计每秒 110 万到 140 万次。只测了修复后的代码，没有原代码对照；测试只走缓存命中路径；stub 用 `std::mutex` 模拟 `PyMutex`，不含真实 CPython 的线程挂起和恢复开销；测试机是共享服务器，有噪声 |
+| 开启 `with_stack` 时 Python 调用变慢，线程越多越明显 | 每次 Python 调用至少获取两次 `data_mutex_`（`genPyCallHashId`、`recordPyCall` 各一次）。stub 环境中测回调吞吐（2026-11-02，3 次运行的范围，日志 `torch_npu-work/tsan-logs/round2/bench-pytracer-hook.log` 的 `pt_fix_plain` 各行，作者本机，未上传）：1 个线程每秒 418 万到 419 万次，6 个线程合计每秒 124 万到 141 万次。只测了修复后的代码，没有原代码对照；测试只走缓存命中路径；stub 用 `std::mutex` 模拟 `PyMutex`，不含真实 CPython 的线程挂起和恢复开销；测试机是共享服务器，有噪声。[analysis.md](analysis.md) 里有一组我们与上游的吞吐对照，那组用的是另一套扩展过的 stub 和另一次运行，两组数字不能互相换算 |
 
 ## 6. 未处理的问题
 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调通过 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。如果 worker 在 profiler 启动前已经创建，其算子不会被记录。worker 的数量和创建时机没有核实。影响是结果缺少这些线程的算子数据，没有观察到崩溃 |
-| `with_stack` 在 FT 下的锁争用 | 彻底解决需要改为每个线程一份事件缓冲和缓存。上游 master 已采用这种结构（见第 1 节） |
+| 基线缺少上游 `b2e659d62f`，3.13+ 读取 `self` 得到空指针 | 和线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已核实，torch_npu 上的崩溃未核实。接手后在第 7 节第 1 步中补上这处修改，做法见 [analysis.md](analysis.md) 第 7.1 节，背景见 [analysis.md](analysis.md) 第 4.2 节 |
+| `with_stack` 在 FT 下的锁争用 | 彻底解决需要改为每个线程一份事件缓冲和缓存。上游 master 已采用这种结构（见第 1 节）。上游这种结构下每个事件仍要获取一次全局 `results_mutex_`，只是次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.5、5.4 节 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 存在竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能正在 `IsMstxDomainEnabled` 中读取 |
 | `ProfilerMgr` 的其他非原子成员 | `path_`、`profConfig_` 等在 `Start/Stop/Init/Finalize` 中写入；多个线程同时调用这些控制函数时没有保护 |
 | 有 GIL 时 `record_params_` 会沿用到下一次采集 | 上游原有的问题，修复会改变有 GIL 时的行为，所以没有改 |
@@ -315,13 +324,18 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 7. 接手后的步骤
 
-1. **决定合入方式。**
+1. **确认崩溃出在哪一处，并补上 `b2e659d62f`。**
+   - 先向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点（开始采集、前向中、停止采集时）。按 [analysis.md](analysis.md) 第 1.5 节，这一步可以排除一部分候选。
+   - 在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 3.14t 运行一个单线程、`with_stack=True`、含 `nn.Module` 前向并包含停止采集（退出 `with` 块）的最小脚本，开启 `PYTHONFAULTHANDLER=1`，需要时加 `PYTHONMALLOC=debug`，确认候选 1、2。不要在本分支上做这一步：候选 2 已在 `663e8ba` 中修改，补上 `b2e659d62f` 之后候选 1 也不存在，脚本不崩溃不能排除任何候选。
+   - **无条件补上 `b2e659d62f` 的 `PyMapping_GetItemString` 修改**（3.13 以下保留 `PyDict_GetItemString`），用 `THPObjectPtr` 持有返回的新引用，取不到时判空跳过；不移植 `~ThreadLocalResult` 在 3.12+ 跳过 `Py_DECREF` 的部分，原因是本分支 `clear()` 已改为持有 GIL 释放 ctx。按 [analysis.md](analysis.md) 第 4.2 节已验证的 C API 行为，3.13 及以上 `PyDict_GetItemString` 必定返回 NULL，所以这处修改不取决于能否复现崩溃。
+   - 补上之后，在本分支上再运行一次同一个脚本，确认不再崩溃。详见 [analysis.md](analysis.md) 第 7.1 节。
+2. **决定合入方式。**
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master：上游这两处的逻辑与 2.13.0 相同。上游做过 clang-format 格式化，补丁不能直接 `git apply`，需要手工合入；没有在 master 上编译过。
-   - 问题 3 建议优先评估上游 `ff5ad88d8a` 的方案：它按线程存放缓存，不存在我们方案中全局 `data_mutex_` 的争用；代价是依赖 CPython 私有 API `_PyEval_StopTheWorld`。我们没有逐行对比两套方案，也没有用本仓库的压力测试测过上游方案。
-2. **编译。** 在 NPU 机器上按 `docs/experimental_free_threaded/` 中的说明，分别编译普通版和 FT 版。
-3. **FT 版验证。** 跑一次多线程推理并开启 `torch_npu.profiler`，建议覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置。确认不再崩溃，并且能正常导出结果。
-4. **普通版验证。** 跑原有的 profiler 测试（`test/profiler/`），确认有 GIL 时行为不变。
-5. **如果仍然崩溃。** 请用 gdb 抓一份调用栈（`bt`）。有调用栈才能确定崩溃位置。
+   - 问题 3 建议以上游 `ff5ad88d8a` 的方案为基础：它按线程存放缓存和事件，全局锁的获取次数比我们方案少、持有时间短（全局锁仍在：FT 构建下每个事件仍要获取一次 `results_mutex_`）；代价是依赖 CPython 私有 API `_PyEval_StopTheWorld`，并且同线程重入时会死锁。两套方案的逐项对照、上游方案在本仓库压力测试下的运行结果，以及合入时建议补的四处修改，见 [analysis.md](analysis.md) 第 4.8、7.3 节。
+3. **编译。** 在 NPU 机器上按 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的"Build and enable deliberately"一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的"Build and wheel identity"一节，分别编译 GIL 版和 FT 版。
+4. **FT 版验证。** 运行一次多线程推理并开启 `torch_npu.profiler`，建议覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置。确认不再崩溃，并且能正常导出结果。
+5. **GIL 版验证。** 运行原有的 profiler 测试（`test/profiler/`），确认有 GIL 时行为不变。
+6. **如果仍然崩溃。** 先用 `PYTHONFAULTHANDLER=1` 获取 Python 层调用栈（FT 构建只打印崩溃线程的），看崩溃发生在前向中还是停止采集时；再用 `PYTHONMALLOC=debug` 运行，让不持有线程状态时的对象释放在释放的位置终止（`PyObject_Free` 已在本机 3.14.3、3.14.3t 上验证，经 `Py_DECREF` 的释放路径属于推断）；最后用 gdb 获取 C++ 调用栈（`bt`）。如果栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 (1)；如果栈顶在 `_Py_Dealloc`、对象的 dealloc 函数或分配器中，往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，对应候选 (2)；栈顶在上报链路或 profile 回调中，对应候选 (3)。栈顶在 pymalloc、mimalloc、`free` 或与 profiler 无关的代码中时，通常是堆损坏【推断】，崩溃位置不等于出错位置，应开启 `PYTHONMALLOC=debug` 重新运行（候选 3 中问题 1 的释放后访问和重复释放，在本仓库压力测试的 ASan 构建中对原代码复现过，见第 4.2 节）。读法详见 [analysis.md](analysis.md) 第 7.1 节。
 
 ## 8. 改动文件
 
