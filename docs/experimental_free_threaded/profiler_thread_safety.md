@@ -15,7 +15,10 @@
   - 有 GIL 时，GIL 让多个 Python 线程基本依次执行，这些问题很少暴露；FT 下多个线程同时执行，就会暴露。
 - **与上游的关系**（2026-11-02 查看 `Ascend/pytorch` master）：
   - 问题 1、2：上游 master 的 `ring_buffer.h`、`data_dumper.cpp` 只改过代码格式，逻辑与 2.13.0 相同，问题仍在。
-  - 问题 3：上游在 `ff5ad88d8a`（2026-10-29，"profiler fix with_stack memory bug"）里给 `profiler_python.cpp` 加了 FT 专用的加锁处理，设计和我们不同。两者没有做逐行比较。
+  - 问题 3：上游在 `ff5ad88d8a`（2026-10-29，"profiler fix with_stack memory bug"）里重构了 `PythonTracer`，设计和我们不同，两者没有逐行比较。上游方案的要点：
+    - 缓存和事件按线程存放在各自的 `ThreadLocalResult` 中，所有线程共用一个 ctx（`shared_ctx_`）；
+    - `control_mutex_`、`report_mutex_` 和每个线程的 `callback_mutex_` 在两种构建中都启用，`results_mutex_` 只在 FT 下启用；
+    - FT 且 CPython ≥ 3.14 时，直接调用 CPython 私有 API `_PyEval_StopTheWorld`/`_PyEval_StartTheWorld`。
 - **修改内容。** 改了 4 个源文件，新增一套压力测试。
 - **验证结果。** 用 stub 头文件（只保留接口、实现最简的替代头文件）把改动的源码单独编译，做压力测试。同一套测试中：
   - 原代码 42 次场景运行全部失败，其中有 SIGSEGV；
@@ -118,7 +121,7 @@ UnInit();  // data_queue_.clear()：销毁缓冲区中的元素，并把大小�
    **注意：** 这两处的 `seq_cst` 不能改弱。按 C++ 内存模型，改弱以后上述"必有一种成立"不再有保证。在 x86 上，原子读-改-写指令本身带有完整内存屏障，所以改弱后压力测试检测不到（变异测试已确认：25 次运行全部通过）。在内存顺序更弱的平台（如 aarch64）上可能出错，这一点没有实测。代码注释已写明"不能改弱、x86 和 TSan 下测不出"。
 
 3. **控制操作加锁。** `Init/Start/Stop/UnInit` 加互斥锁 `control_mutex_`，同一时间只有一个控制操作在执行。
-   - 原因：第一轮审阅发现，两个线程同时调用 `Stop` 时，两个线程会同时从缓冲区读数据，而新缓冲区只支持一个读取方。
+   - 原因：第一轮审阅发现，两个线程同时调用 `Stop` 时，两个线程会同时从缓冲区读数据，而缓冲区（修改前后都一样）只支持一个读取方。
    - `Report` 路径不获取这把锁。
 
 4. **其他修改：**
@@ -180,7 +183,7 @@ Pop:
 
 | 锁 | 保护对象 | 规则 |
 |---|---|---|
-| `control_mutex_` | 让 `start/stop/clear` 依次执行；保护 `interpreter_` | 持有期间会执行 Python 代码。Python 代码中的析构函数或 `__getattr__` 可能再次调用 `start/stop/clear`，而 `PyMutex` 不可重入，所以同一线程重入时抛出异常，避免死锁 |
+| `control_mutex_` | 让 `start/stop/clear` 依次执行；保护 `interpreter_` | 持有期间会执行 Python 代码。Python 代码中的终结器（如 `__del__`）或 `__getattr__` 可能再次调用 `start/stop/clear`，而 `PyMutex` 不可重入，所以同一线程重入时抛出异常，避免死锁 |
 | `registration_mutex_` | `thread_local_results_`、`start_py_call_info_`、会话计数 `session_` | 持有期间不调用 Python、不分配 Python 对象 |
 | `data_mutex_` | 回调写入的各缓存、`events_`、`ctx_tid_map_` | 同上 |
 
@@ -204,7 +207,7 @@ Pop:
 - `start()` 给所有线程安装同一个共享 ctx（`shared_ = true`），通过 `PyEval_SetProfileAllThreads` 在 stop-the-world 期间统一安装。
 - 共享 ctx 的 `start_py_call_info_`、`ctx_tid_map_` 改用线程 id 作为键（见 `ctxKey()`），子线程自己注册的 ctx 仍用地址作为键。
 
-按阅读代码判断，有 GIL 时外部可观察的行为不变：上面的逻辑修改只在出现竞争时才改变执行路径。这一结论没有经过运行验证。
+按阅读代码判断，有 GIL 时外部可观察的行为不变：除 `clear()` 改为获取 GIL 外，其余逻辑修改只在出现竞争时才改变执行路径。这一结论没有经过运行验证。
 
 ## 4. 验证
 
@@ -254,17 +257,17 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ### 4.4 审阅
 
-修改过程中做了四轮独立审阅，共发现约 20 个问题，现已全部修复。其中几个是前一轮修复本身引入的：
+修改过程中做了四轮独立审阅。前两轮共提出 21 条意见：16 条修改了代码或测试，2 条更正了报告措辞，1 条在代码注释中说明（槽位内存增加），2 条只做了性能测量、没有改代码（`writers_` 计数开销、`with_stack` 锁争用，见第 5 节）。第三轮发现第二轮修复中的两处问题，已修复。其中几个问题是前一轮修复本身引入的：
 
 - 两个线程同时 `Stop`；
 - `clear()` 重入导致死锁；
 - `startOne` 在 `stop()` 之后仍然安装回调。
 
-最后一轮两位审阅者都判定没有严重或重要问题。
+第四轮两位审阅者都判定没有严重或重要问题；其中确认的一处引用泄漏已在 `f36d74d` 修复，其余轻微问题写入了代码注释或本文第 6 节。
 
 ### 4.5 测试覆盖不到的内容
 
-- **stub 与真实 CPython 3.14 不完全一致。** 例如真实的 `PyEval_SetProfile` 会触发审计回调；stub 中的 `ModuleInfo`、`parseModuleParams` 不会抛出异常。
+- **stub 与真实 CPython 3.14 不完全一致。** 例如真实的 `PyEval_SetProfile` 会触发审计回调；`ModuleInfo`、`parseModuleParams`（真实代码）调用的 CPython 接口在 stub 中从不报错，所以测试覆盖不到它们抛出 Python 异常的路径。
 - **有 GIL 的路径**只编译、不运行。
 - **测试检出回归的能力有限。** 变异测试（故意改回某个错误，看测试能否发现），每项 25 次运行：
 
@@ -303,7 +306,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调通过 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。如果 worker 在 profiler 启动前已经创建，其算子不会被记录。worker 的数量和创建时机没有核实。影响是结果缺少这些线程的算子数据，没有观察到崩溃 |
-| `with_stack` 在 FT 下的锁争用 | 彻底解决需要改为每个线程一份事件缓冲和缓存 |
+| `with_stack` 在 FT 下的锁争用 | 彻底解决需要改为每个线程一份事件缓冲和缓存。上游 master 已采用这种结构（见第 1 节） |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 存在竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能正在 `IsMstxDomainEnabled` 中读取 |
 | `ProfilerMgr` 的其他非原子成员 | `path_`、`profConfig_` 等在 `Start/Stop/Init/Finalize` 中写入；多个线程同时调用这些控制函数时没有保护 |
 | 有 GIL 时 `record_params_` 会沿用到下一次采集 | 上游原有的问题，修复会改变有 GIL 时的行为，所以没有改 |
@@ -313,8 +316,8 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 ## 7. 接手后的步骤
 
 1. **决定合入方式。**
-   - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以直接用于上游 master，上游这两处的逻辑与 2.13.0 相同。
-   - 问题 3 请先对比上游 `ff5ad88d8a` 中 `profiler_python.cpp` 的 FT 处理，再决定沿用哪一套，或者两者合并。我们没有做这项对比。
+   - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master：上游这两处的逻辑与 2.13.0 相同。上游做过 clang-format 格式化，补丁不能直接 `git apply`，需要手工合入；没有在 master 上编译过。
+   - 问题 3 建议优先评估上游 `ff5ad88d8a` 的方案：它按线程存放缓存，不存在我们方案中全局 `data_mutex_` 的争用；代价是依赖 CPython 私有 API `_PyEval_StopTheWorld`。我们没有逐行对比两套方案，也没有用本仓库的压力测试测过上游方案。
 2. **编译。** 在 NPU 机器上按 `docs/experimental_free_threaded/` 中的说明，分别编译普通版和 FT 版。
 3. **FT 版验证。** 跑一次多线程推理并开启 `torch_npu.profiler`，建议覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置。确认不再崩溃，并且能正常导出结果。
 4. **普通版验证。** 跑原有的 profiler 测试（`test/profiler/`），确认有 GIL 时行为不变。
