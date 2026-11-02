@@ -32,14 +32,21 @@
 
 ```mermaid
 flowchart LR
-    W["写入方：业务线程、C++ 线程"] -->|"ProfilerMgr::Upload*"| R["DataDumper::Report"]
-    R -->|Push| B["RingBuffer"]
-    B -->|Pop| T["读取方：后台线程"]
-    T --> F["FRAMEWORK/ 下的文件"]
+    W["写入方：业务线程、C++ 线程"] -->|"ProfilerMgr::Upload"| R1["dataReceiver_：DataDumper::Report"]
+    W -->|"ProfilerMgr::UploadWithLock"| R2["dataReceiverWithLock_：DataDumper::Report"]
+    R1 -->|Push| B1["RingBuffer"]
+    R2 -->|Push| B2["RingBuffer"]
+    B1 -->|Pop| T1["读取方：后台线程"]
+    B2 -->|Pop| T2["读取方：后台线程"]
+    T1 --> F["FRAMEWORK/ 下的文件"]
+    T2 --> F
     P["PythonTracer 的 profile 回调"] --> E["events_ 和各缓存"]
-    E -->|"达到 TRACE_DUMP_THRESHOLD 或停止采集"| D["TraceDataDumper"]
-    D --> B2["TraceDataDumper 的 RingBuffer 和后台线程"]
-    B2 --> F2["文件"]
+    E -->|"达到 TRACE_DUMP_THRESHOLD 或停止采集"| M["ProfilerMgr::UploadTraceEventData、UploadTraceHashData、UploadParamData"]
+    M -->|"Report"| B3["traceDataReceiver_ 的 RingBuffer"]
+    M -->|"ReportHash、ReportParam"| X["trace_hash_data_、param_data_，由 extra_data_mutex_ 保护"]
+    B3 -->|Pop| T3["TraceDataDumper 的读取方"]
+    T3 --> F2["文件"]
+    X -->|"Stop 时写出"| F2
 ```
 
 - `RingBuffer` 是固定长度的数组。写到末尾后，从开头继续写。
@@ -80,7 +87,7 @@ sequenceDiagram
     W->>B: 进入 Push，通过 is_inited_ 检查
     S->>S: Stop，start_ 置为 false，join 读取方，Flush
     S->>B: UnInit，clear 销毁全部元素
-    W->>B: 对已销毁的 unique_ptr 元素赋值
+    W->>B: 对已销毁的 unique_ptr 元素赋值，或与 clear() 同时操作同一个 unique_ptr
     Note over W,B: 重复释放、释放后访问或记录泄漏
 ```
 
@@ -90,7 +97,7 @@ sequenceDiagram
 
 - `RingBuffer::is_inited_` 是普通 `bool`。多个线程同时读写它，按 C++ 标准属于未定义行为。
 - `TraceDataDumper::ReportHash/ReportParam` 给 `unique_ptr` 成员赋值。停止方可能同时读这个成员。两者之间没有同步。
-- `GatherAndDumpData` 有一个函数内 `static bool create_flag`。三个上报器的读取方共用这一个变量。
+- `DataDumper::GatherAndDumpData`（`d3216c2` 的 `data_dumper.cpp` 第 83 行）和 `TraceDataDumper::CreateDumpDir`（第 235 行）各有一个函数内 `static bool create_flag`。两个 `DataDumper` 实例的读取方共用前一个。
 
 **修改 1：写入方先登记，再检查。** 新增原子计数 `writers_`，记录当前处于 `Report` 内的写入方数量。
 
@@ -125,13 +132,12 @@ UnInitLocked():
 sequenceDiagram
     participant W as 写入方
     participant S as 停止方
-    W->>W: writers_.fetch_add 1，seq_cst
-    W->>W: 读 start_，seq_cst
-    S->>S: start_.exchange false，seq_cst
-    S->>S: 读 writers_，seq_cst
-    alt 写入方读到 start_ 为 false
+    Note over W: 先 writers_.fetch_add 1，再读 start_，都用 seq_cst
+    Note over S: 先 start_.exchange false，再读 writers_，都用 seq_cst
+    Note over W,S: 两方的操作之间没有固定先后
+    alt 两种可能的全局顺序。其一：写入方读到 start_ 为 false
         W->>W: 不访问缓冲区，fetch_sub 1
-    else 停止方读到 writers_ 大于 0
+    else 其二：停止方读到 writers_ 大于 0
         S->>S: WaitWriters 忙等
         W->>W: Push 完成后 fetch_sub 1，release
         S->>S: 读到 writers_ 为 0，继续 Stop 和 UnInit
@@ -161,7 +167,8 @@ sequenceDiagram
 - `Start` 改为先置 `start_ = true`，再创建读取方线程。原代码顺序相反，读取方可能启动后立即读到 false 并退出。
 - `ReportHash/ReportParam` 和对应的 Flush 用互斥锁 `extra_data_mutex_` 保护。这两个函数调用次数很少。
 - `create_flag` 改为每个实例一份（`create_dir_flag_`）。
-- `Flush` 按每次实际取出的条数循环，不再依赖 `Size()`。这样不会在未写完的槽位上忙等。读取方的 `Run` 做了同样的修改。
+- `Flush` 按每次实际取出的条数循环，不再依赖 `Size()`。这样不会在未写完的槽位上忙等。
+- 读取方的 `Run` 取不到记录时休眠。`DataDumper::Run` 仍读 `Size()`，但不再据此忙等。`TraceDataDumper::Run` 按取出结果判断。
 
 ### 问题 2：多个写入方同时写入时，读取方可能读到未写完的槽位
 
@@ -291,7 +298,10 @@ GIL 构建中外部可观察的行为不变（推断，没有运行验证）。�
 | `trace` | 同上，对象是 `TraceDataDumper`，同时调用 `ReportHash/ReportParam`。 |
 | `pytracer` | 多个线程执行 profile 回调和 `startOne/stopOne`。主线程反复执行 `start/stop/clear`。每次 `stop` 之后、进行中的 `startOne` 全部返回时，检查没有线程仍安装着回调。 |
 
-- 编译方式：TSan 构建、ASan 构建、plain 构建。`run.py` 把 ASan、UBSan、LSan 的报告都判为失败。
+- 编译方式：TSan 构建、ASan 构建、plain 构建。
+- ASan 构建同时开启 UBSan（`-fsanitize=address,undefined`），UBSan 报告含 `runtime error:`。
+- Linux 上 ASan 构建默认开启 LSan。`run.py` 也设置了 `detect_leaks=1`。
+- `run.py` 把这几种 sanitizer 的报告都判为失败。所以一次 ASan 构建失败可能来自 ASan、UBSan 或 LSan。
 - 每个场景重复 3 次。`rb` 场景的缓冲区容量：TSan 构建用 64 和 1024，ASan 构建用 64，plain 构建用 64 和 4096。
 - 合计 TSan 构建 15 次、ASan 构建 12 次、plain 构建 15 次，共 42 次场景运行。
 - 另有 7 次编译检查，其中一次是 GIL 路径的只编译检查。编译检查不计入下表。
@@ -363,7 +373,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调用 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。worker 如果在 profiler 启动前创建，profiler 不记录它的算子。worker 的数量和创建时机没有核实。影响是结果缺少这些算子数据，没有观察到崩溃。 |
-| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证，torch_npu 上的崩溃未验证。接手后在第 4 步补上，做法和背景见 [analysis.md](analysis.md) 第 7.1、4.2 节。 |
+| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证，torch_npu 上的崩溃未验证。接手后按 [analysis.md](analysis.md) 第 7.1 节第 4 步补上，做法和背景见 [analysis.md](analysis.md) 第 7.1、4.2 节。 |
 | `with_stack` 在 FT 构建下的锁争用 | 彻底解决要改为每个线程一份事件缓冲和缓存。上游 master 已是这种结构。上游每个事件仍获取一次全局 `results_mutex_`，次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.4、5.4 节。 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 有竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能在 `IsMstxDomainEnabled` 中读取。 |
 | `ProfilerMgr` 的其他非原子成员 | `Start/Stop/Init/Finalize` 写入 `path_`、`profConfig_` 等成员。多个线程同时调用这些控制函数时没有保护。 |
@@ -377,6 +387,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 2. 决定合入方式：
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master。上游这两处逻辑与 2.13.0 相同，但做过 clang-format。补丁不能直接 `git apply`，要手工合入。这些修改没有在 master 上编译过。
    - 问题 3 建议以上游 `ff5ad88d8a` 为基础，并补四处修改。理由和修改内容见 [analysis.md](analysis.md) 第 7.3 节。
+   - 上游方案的代价：依赖 CPython 私有 API `_PyEval_StopTheWorld`；同线程重入时死锁。见 [analysis.md](analysis.md) 第 4.6 节。
 3. 在 GIL 构建上运行原有的 profiler 测试（`test/profiler/`），确认行为不变。
 
 ## 8. 改动文件
