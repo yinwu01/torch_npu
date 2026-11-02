@@ -3,10 +3,11 @@
 - 对应修复：`yinwu01/torch_npu` 分支 `fix/profiler-thread-safety`，提交 `663e8ba`、`f36d74d`。问题编号与 [fix_details.md](fix_details.md) 一致。
 - 本文回答四件事：问题是怎么定位出来的；每个问题还有哪些修法、为什么选了现在这个；上游 `ff5ad88d8a` 的方案和我们的差别；接手的工程师该怎么做。
 - 日期：2026-11-02。代码事实来自本仓库 `f36d74d` 和上游文件；测量在本机 stub 环境中完成。
+- 时间顺序：第 2、3、5 节的测量（2026-11-02 03:58 至 04:23 `-0800`）都晚于修复提交（`663e8ba` 02:47、`f36d74d` 03:07）和最初的文档（`675f2e9` 03:48、`da752e6` 03:51），属于事后核对；当初的方案选择依据的是推理。
 - 标注约定：**【已验证】** 表示读过原文、运行过命令或测试；**【推断】** 表示只根据阅读代码得出，没有运行验证。没有标注的句子是代码事实或本文的组织性说明。
 - **文中引用的日志路径（`/SSD1/wuyin/project/torch_npu-work/…`）都在作者本机，没有上传 GitHub，接手的工程师无法打开。** 保留这些路径是为了说明每个数字出自哪一次运行。第 6.5 节列出的脚本（变体生成、基准、上游对照、`py314-checks/` 下的脚本）同样只在作者本机，没有进仓库，**所以本文第 2、3、5 节的数字、第 7.3 节建议的依据都无法由他人复现**。第 7.3 节第 4 条建议把这套测试整理进仓库，本次交付没有做。
 - 本文所用测试工具的运行依赖：Linux，g++ 11.4（C++17，支持 `-fsanitize=thread`、`-fsanitize=address`），Python 3.8 以上（只用标准库），`systemd-run --user`。不需要 torch、CANN、NPU，不需要联网。第 4.2 节的 CPython 行为核对另外用了 CPython 3.14.3、3.14.3t（python-build-standalone 构建，解包在 `torch_npu-work/py314/`）和 CPython 3.12.13（本机已有的解释器，来源未记录）。
-- 审阅：本目录五个文件在整理时经过两轮文档审阅（AI 模型子代理，没有人工审阅），本文按两轮意见修改过。
+- 审阅：本目录五个文件在整理后经过三轮文档审阅（AI 模型子代理，没有人工审阅）；第三轮审阅意见已修改，修改后未再经独立审阅。
 
 ## 术语
 
@@ -85,11 +86,11 @@
 
 **按使用方的配置和崩溃时机排除候选**【推断，依据读 `d3216c2` 的代码和第 4.2 节】。在不知道使用方的 profiler 配置和崩溃时机的情况下，三个候选无法排序；知道这两项之后可以排除一部分，不需要 gdb：
 
-- `PythonTracer` 只在开启 `with_stack` 或 `with_modules`、并且采集 CPU activity 时启动：`npu_profiler.cpp` 第 95–98 行的 `tracePython()` 返回 `(with_stack || with_modules) && activities_.count(CPU)`，第 354–355 行的 `kStartAll` 和第 391–393 行的 `kStop`、`kClear` 都受它控制。候选 1、2 都在 `PythonTracer` 中，所以这两项都没开时只剩候选 3。
+- `PythonTracer` 只在开启 `with_stack` 或 `with_modules`、并且采集 CPU activity 时启动：`npu_profiler.cpp` 第 95–98 行的 `tracePython()` 返回 `(with_stack || with_modules) && activities_.count(CPU)`，第 354–355 行的 `kStartAll` 和第 391–393 行的 `kStop`、`kClear` 都受它控制。候选 1、2 和候选 3 中的问题 3 都在 `PythonTracer` 中，所以这两项都没开（或不采集 CPU activity）时只剩候选 3 中的问题 1、2。
 - 在 3.13 及以上，`d3216c2` 的 `genPyCallHashId`（`profiler_python.cpp` 第 602–611 行）进入 `nn.Module.__call__` 帧时取得 NULL，`get_hash(NULL)` 不在缓存中，随即执行 `ModuleInfo(NULL)`。所以只要采集期间调用过任何 `nn.Module`，候选 1 就在第一次前向时发生，早于停止采集，候选 2 没有机会出现；候选 2 只可能出现在采集期间没有调用过 `nn.Module` 的情况。另外，`start()` 记录已有调用栈时也调用 `genPyCallHashId`（第 337 行），如果开始采集时调用栈里已有 `nn.Module.__call__` 帧，候选 1 在开始采集时就会发生。
 - 对应关系：崩溃发生在开始采集或前向中，对应候选 1，或者候选 3 中的问题 2、3（这两处在采集期间也会发生，但需要多个写入方同时上报或多个 Python 线程同时执行回调）。只有一个 Python 线程时问题 3 不会发生，但问题 2 的写入方还包括算子下发、NPU 任务队列出队等 C++ 线程（第 1.3 节），所以不能据此排除问题 2。崩溃发生在停止采集时（`prof.stop()` 或退出 `with` 块），对应候选 2，或者候选 3 中的问题 1、问题 3 的 `stop/clear` 与回调之间的竞争。
 
-所以接手后的第一步是向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点（第 7.1 节）。
+所以接手后的第一步是向使用方要 profiler 配置（`with_stack`、`with_modules`、`activities` 是否含 CPU、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点（第 7.1 节）。
 
 ## 2. 问题 1 的候选方案
 
@@ -109,12 +110,12 @@
 ### 2.2 候选 B：读写锁
 
 - **做法。** `Report` 以共享方式持有 `std::shared_mutex`，多个写入方可以同时持有；`Stop` 以独占方式获取一次，等待所有共享持有者退出。
-- **热路径开销。** 每次 `Report` 获取和释放一次共享锁。共享获取需要修改锁内的读者计数，所有写入线程仍争用同一缓存行，开销高于 `writers_` 的两次 `fetch_add/fetch_sub`。
+- **热路径开销。** 每次 `Report` 获取和释放一次共享锁。共享获取需要修改锁内的读者计数，所有写入线程仍争用同一缓存行；【推断】开销高于 `writers_` 的两次 `fetch_add/fetch_sub`。
 - **内存。** 一个 `std::shared_mutex`（glibc 上 56 字节）。
 - **复杂度。** 低。
 - **行为变化。** glibc 读写锁的默认类型偏向读者（`/usr/include/pthread.h`：`PTHREAD_RWLOCK_DEFAULT_NP = PTHREAD_RWLOCK_PREFER_READER_NP`；libstdc++ 的 `std::shared_mutex` 是否使用默认类型没有核实）；写入方持续上报时，`Stop` 的独占获取可能等待较久。这一点没有测量。
-- **实测。** `Report` 调用速率：8 线程 2.40 到 3.73（3.49），低于采用方案的 3.86 到 4.32（3.98），范围不重叠；32 线程 1.79 到 3.20（3.06），中位数低于采用方案，范围重叠。接受速率（最终写进文件的记录数）方向相反：8 线程 2.24 到 2.49（2.35），高于采用方案的 2.02 到 2.16（2.08），范围不重叠；32 线程 1.41 到 1.61（1.46）对 1.26 到 1.49（1.33），中位数较高，范围重叠。
-- **结论。** 放弃。它与采用的方案结构相同（写入方登记、停止方等待），只是把计数放进锁里；去掉锁的部分就是候选 E。放弃的理由只是业务线程在 `Report` 中停留的时间更长（调用速率较低）；在本机测量中它的接受速率不低于采用方案，8 线程时还更高。如果维护者更看重"用标准库原语、不手写内存序"，这是最接近的替代方案。
+- **实测。** 见第 2.7 节。这组数据不能区分它与采用方案的单次调用开销。
+- **结论。** 放弃。它与采用的方案结构相同（写入方登记、停止方等待），只是把计数放进锁里；去掉锁的部分就是候选 E。选择候选 E 的依据是设计推理：`Report` 路径不取锁。如果维护者更看重"用标准库原语、不手写内存序"，这是最接近的替代方案。
 
 ### 2.3 候选 C：缓冲区在进程生命周期内只分配一次，从不释放
 
@@ -146,7 +147,7 @@
 - **复杂度。** 中等。正确性依赖 `seq_cst`，改弱后在 x86 和 TSan 下都测不出（[fix_details.md](fix_details.md) 第 4.5 节的变异 25 次运行全部通过）。
 - **行为变化。** `Stop` 中忙等写入方退出；fork 出的子进程如果继承了大于 0 的 `writers_`，`Stop` 会一直等待（[fix_details.md](fix_details.md) 第 6 节）。
 - **实测。** 单位为百万次/秒，5 次重复的范围（中位数）。8 线程 3.86 到 4.32（3.98），32 线程 2.40 到 4.05（3.78）。与参照变体（只去掉 `writers_` 登记和 `WaitWriters` 等待、其余修改保留，不是有效修复；8 线程 3.78 到 5.27（4.89），32 线程 2.49 到 5.25（4.34））相比中位数较低，但范围重叠，5 次重复不足以确定这两次原子操作的开销。之前一轮测量（`torch_npu-work/tsan-logs/round2/bench-report-writers.log`，同一机器，每组 3 次）中，8 线程和 32 线程两组范围重叠；单线程一组范围不重叠，有 `writers_` 为 4.32 到 4.73，无 `writers_` 为 4.91 到 4.93，有 `writers_` 的一侧较慢。
-- **为什么采用。** 在测得的有效方案中，多线程下 `Report` 调用速率的中位数最高（与读写锁相比，8 线程范围不重叠，32 线程范围重叠），即业务线程在 `Report` 中停留的时间最短。接受速率上它没有优势：8 线程时读写锁的接受速率高于本方案（范围不重叠），互斥锁与本方案相当（中位数 2.11 对 2.08），所以采用本方案的理由不包括写文件更快。此外，就本节 5 次重复的数据而言，与去掉 `writers_` 的参照变体的差别没有超出本机噪声（较早一轮每组 3 次的测量在单线程上显示出差别，见上一条）；改动只限 `data_dumper.h/.cpp`，`ProfilerMgr` 和调用方不需要修改。
+- **为什么采用。** 依据是设计推理：`Report` 路径不取锁，只多两次原子读-改-写；改动只限 `data_dumper.h/.cpp`，`ProfilerMgr` 和调用方不需要修改。本节的测量在修复提交之后进行（见文首），不能区分它与读写锁的单次调用开销（第 2.7 节）。
 
 ### 2.6 候选 F：每个写入线程一个缓冲区
 
@@ -179,8 +180,9 @@
 读法：
 
 - 单线程时四个变体范围重叠，无法区分。
-- 8、32 线程时，各变体的接受速率都在 1.1 到 2.5 之间，明显低于调用速率，说明总速率受读取方（编码并写文件）限制，多出来的调用因缓冲区写满被丢弃。其中读写锁 8 线程的接受速率 2.24 到 2.49 高于采用方案的 2.02 到 2.16，范围不重叠；32 线程时读写锁的中位数也更高（1.46 对 1.33），范围重叠。互斥锁变体的接受速率几乎等于调用速率，因为锁让写入线程变慢，缓冲区很少写满。
-- 所以互斥锁的代价主要体现为业务线程在 `Report` 中花的时间：8 线程时调用速率中位数约为采用方案的 0.53 倍，32 线程时约 0.33 倍，且范围不重叠。
+- 8、32 线程时，各变体的接受速率都在 1.1 到 2.5 之间，说明总速率受读取方（编码并写文件）限制，多出来的调用因缓冲区写满被丢弃。
+- 调用速率包含缓冲区写满后 `Push` 直接失败返回的调用，而各变体的丢弃比例不同：按中位数估算（无出处），8 线程时采用方案约 48%、读写锁约 33%，32 线程时约 65% 对 52%；互斥锁几乎不丢弃。所以调用速率不能比较单次完整写入的开销，这组数据不能区分采用方案与读写锁的单次调用开销。
+- 互斥锁的调用速率低于采用方案（8、32 线程范围不重叠），接受速率与采用方案相当（8 线程中位数 2.11 对 2.08，32 线程范围重叠）。
 - 原始记录：`torch_npu-work/alt-bench/results/20261102T120205Z/report_bench.log`，汇总 `summary.txt`。
 
 ## 3. 问题 2 的候选方案
@@ -232,7 +234,7 @@
 - **复杂度。** 中等，`ring_buffer.h` 共 179 行，接口不变。
 - **行为变化。** 容量向上取整到 2 的幂；可用容量从 capacity-1 变为 capacity；`Size()` 包含已占用但尚未写完的槽位（[fix_details.md](fix_details.md) 第 3、5.1 节）。
 - **实测（队列基准）。** 8、32 线程、容量 2^20 时写入从未失败，读取方取出速率与写入速率一致（8 线程 2.82 到 4.00，32 线程 1.54 到 2.41）；所有运行中错序和丢失计数为 0。
-- **为什么采用。** 读取方不与写入方争锁，多线程下写文件速率在测得的有效方案中最高；不需要第三方代码，接口不变，`data_dumper.cpp` 以外的调用方不需要修改。代价是内存翻倍。
+- **为什么采用。** 读取方不与写入方争锁；第 3.7 节的事后测量（见文首）中，多线程下取出速率在测得的有效方案中最高；不需要第三方代码，接口不变，`data_dumper.cpp` 以外的调用方不需要修改。代价是内存翻倍。
 
 ### 3.5 候选 E：每个写入线程一个 SPSC 队列，由读取方合并
 
@@ -287,7 +289,7 @@
 
 ### 4.1 上游改了什么、为什么
 
-对照对象：`Ascend/pytorch` master（2026-11-02 查看时 HEAD 为 `790544fa`）的 `torch_npu/csrc/profiler/profiler_python.cpp`，该文件最后一次修改是 `ff5ad88d8a`（2026-10-29，"profiler fix with_stack memory bug"，合并请求 `Ascend/pytorch!48607`，分支 `gilmemory`，只改这一个文件，+360/−240）。
+对照对象：`Ascend/pytorch` master（2026-11-02 查看时 HEAD 为 `790544fa`）的 `torch_npu/csrc/profiler/profiler_python.cpp`，该文件最后一次修改是 `ff5ad88d8a`（2026-10-29，"fix:profiler fix with_stack memory bug"，合并请求 `Ascend/pytorch!48607`，分支 `gilmemory`，只改这一个文件，+360/−240）。
 
 关联 issue 是 `Ascend/pytorch` #5658（gitcode，2026-10-26 创建，查看时状态 open），标题"[Bug]: profiler存在违规内存操作，会导致采集堆栈时coredump"，正文原文：
 
@@ -330,7 +332,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 
 【推断】综合以上：在 3.13 及以上开启 `with_stack` 或 `with_modules` 后（上表只实测了 3.12.13、3.14.3、3.14.3t；3.13 没有实测，结论依据 PEP 667 推断），第一次 `nn.Module` 调用进入回调时进程就会崩溃，与线程数无关，GIL 构建同样成立。Optimizer 分支在 `record_params_` 为真时（`profile_memory` 且 `record_shapes`，并且开启 `with_stack` 或 `with_modules`）对 NULL 调用 `parseOptimizerParams`，同样会对空指针取属性。使用方报告的现象是"FT 下 SIGSEGV、没有调用栈"，与这一路径相符，但**没有用真实的 torch_npu 运行确认，不能据此认定就是这一处**。
 
-确认方法：在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 3.14t 运行一个单线程、`with_stack=True`、含 `nn.Module` 前向的最小脚本，脚本要包含停止采集（退出 `with` 块）。如果崩溃出在这一处，`gdb bt` 的栈顶应在 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。在本分支上运行这个脚本确认不了这一点：候选 2 在 `663e8ba` 中已改，补上 `b2e659d62f` 之后候选 1 也不存在，脚本不崩溃不能说明使用方的崩溃与这两处无关。补上之后在本分支上再运行一次同一个脚本，用来确认修改有效。步骤见第 7.1 节。
+确认方法见第 7.1 节第 2 步。如果崩溃出在这一处，`gdb bt` 的栈顶应在 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
 
 我们的压力测试没有发现这个问题，原因是 stub 的 `py::handle::attr` 不访问对象，传入 NULL 不会崩溃。
 
@@ -399,7 +401,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | `start/stop/clear` 与其他线程的关系 | `control_mutex_` 让三者依次执行；`startOne/stopOne` 不取 `control_mutex_` | `start/stop/clear/startOne/stopOne` 全部取 `control_mutex_`，依次执行。`stop()` 在 `disableCallbacks()` 中先置 `active_ = false`、清除所有线程的回调，再释放 GIL，逐个获取每个线程的 `callback_mutex_` 并置 `enabled_ = false`（上游 446–456 行） |
 | 子线程在 `stop()` 之后才完成登记 | `startOne` 不持有控制锁。它在 `registration_mutex_` 内登记并记下 `session_`，装好回调后再检查一次 `session_`；如果已变化就移除自己装的回调，最多重试一次 | `startOne` 整个函数体（包括 `PyEval_SetProfile`）都持有 `control_mutex_`，并在锁内检查 `active_`（上游 335–359 行）。因此它要么在 `stop()` 之前完成（之后被 `stop()` 清除），要么在 `stop()` 之后执行并直接返回 |
 | 启动时记录已有调用栈 | FT：只记录调用 `start()` 的线程自己的栈。GIL：沿用原来的 `PyThreadState_Swap` 逐线程切换 | FT 3.14+：在 `_PyEval_StopTheWorld` 暂停期间枚举所有线程，用 `PyThreadState_GetFrame` 读每个线程的栈（上游 306–318 行）。GIL：同样枚举，靠 GIL 保证不并发。不再使用 `PyThreadState_Swap` |
-| CPython 私有 API | 没有调用私有函数，用到的函数都是公开 API：`PyMutex`、`PyEval_SetProfileAllThreads`、`PyThread_get_thread_ident`。但和上游一样直接读 `PyThreadState` 的 `c_profilefunc`、`c_profileobj` 字段（第 518、560、592、628 行；`d3216c2` 原代码也读）。【已验证】这两个字段定义在 `Include/cpython/pystate.h` 的 `struct _ts` 中（3.14.3 头文件第 134、136 行，不在 `Py_BUILD_CORE` 保护内），C API 文档没有说明它们，结构体布局不属于稳定接口 | FT ≥ 3.14：`_PyEval_StopTheWorld`/`_PyEval_StartTheWorld`，源文件里自己写 `extern "C"` 声明（上游 60–62 行）。3.9–3.12：`_PyEval_SetProfile(thread_state, …)`（【已验证】3.11、3.12 的这个声明在公开头文件 `cpython/ceval.h`） |
+| CPython 私有 API | 没有调用私有函数，用到的函数都是公开 API：`PyMutex`、`PyEval_SetProfileAllThreads`、`PyThread_get_thread_ident`。但直接读 `PyThreadState` 的 `c_profilefunc` 字段（第 518、592、628 行；上游和 `d3216c2` 原代码也读），第 560 行还读 `c_profileobj`（只有我们新加的代码读）。【已验证】这两个字段定义在 `Include/cpython/pystate.h` 的 `struct _ts` 中（3.14.3 头文件第 134、136 行，不在 `Py_BUILD_CORE` 保护内），C API 文档没有说明它们，结构体布局不属于稳定接口 | FT ≥ 3.14：`_PyEval_StopTheWorld`/`_PyEval_StartTheWorld`，源文件里自己写 `extern "C"` 声明（上游 60–62 行）。3.9–3.12：`_PyEval_SetProfile(thread_state, …)`（【已验证】3.11、3.12 的这个声明在公开头文件 `cpython/ceval.h`） |
 | GIL 构建的行为变化 | 【推断】只有 `clear()` 改为获取 GIL；其余逻辑修改只在出现竞争时改变执行路径 | 【推断】`start()` 跟踪所有线程，不再有 `max_threads`（原来默认上限 256）。`stop()` 通过 `setProfileAllThreads(nullptr, nullptr)` 清除所有线程的 profile 函数，包括 cProfile 等其他工具设置的（原代码只清除自己装的）。每个事件多一次哈希表查找、一次 `shared_ptr` 复制和一次 `try_lock`。`start/stop/startOne/stopOne` 各多一次释放、重新获取 GIL |
 | 热路径（FT） | `PyTrace_CALL`：至少两次获取全局 `data_mutex_`（`genPyCallHashId`、`recordPyCall` 各一次）；`nn.Module` 调用帧每次再多取一次（查 `module_info_cache_`，`f36d74d` 第 851–859 行），首次出现的模块再多取一到两次（插入缓存、写参数）。返回事件：一次。临界区内做缓存查找或插入、追加事件，事件数到阈值时在锁内上传 | 每个事件一次全局 `results_mutex_`（只做哈希表查找和 `shared_ptr` 复制），一次本线程 `callback_mutex_` 的 `try_lock`。缓存和事件写在本线程对象里，不取全局锁。上传到 `ProfilerMgr` 时取 `report_mutex_` |
 | 3.13+ 读取 `self` | `PyDict_GetItemString`，3.13+ 上返回 NULL（第 4.2 节） | `PyMapping_GetItemString`，取不到时抛出 `KeyError`，由回调的 `catch (...)` 捕获并丢弃（上游 640–681、752 行） |
@@ -446,7 +448,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 上游 | 3.13t 只告警，不做 STW，仍存在读其他线程栈的竞态 | 读代码 |
 | 上游 | 等 `results_mutex_` 时不 detach，以后若在持有它时引入 Python 调用或 STW，会死锁 | 推断 |
 | 我们 | 缺少 3.13+ 的 `PyMapping_GetItemString` 修改，3.14 上进入 `nn.Module` 分支时对 NULL 取属性 | C API 行为已验证；torch_npu 实际崩溃未验证 |
-| 我们 | 直接读 `PyThreadState` 的 `c_profilefunc`、`c_profileobj`，这两个字段不属于稳定接口，CPython 小版本之间结构体布局可能变化（上游同一位置也读，`d3216c2` 原代码也读，所以不是两种方案的差别） | 读代码和 3.14.3 头文件（第 4.8 节） |
+| 我们 | 直接读 `PyThreadState` 的 `c_profilefunc`、`c_profileobj`，这两个字段不属于稳定接口，CPython 小版本之间结构体布局可能变化（上游和 `d3216c2` 只读 `c_profilefunc`；`c_profileobj` 只有我们新加的代码读） | 读代码和 3.14.3 头文件（第 4.8 节） |
 | 我们 | FT 构建每次 Python 调用至少取两次全局 `data_mutex_`，线程多时变慢 | stub 吞吐见第 5.4 节和 [fix_details.md](fix_details.md) 第 5.2 节 |
 | 我们 | `session_` 和重试逻辑较复杂；一次 `startOne` 期间经历两轮 stop/start 时漏采该线程 | 代码注释已写明 |
 | 我们 | 与上游 master 结构不同，无法直接合入，后续同步要手工合并 | 已验证（上游已重写该文件） |
@@ -518,7 +520,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 8 | 2.4–3.2 | 1.2–1.6 | 3.1–3.6 | 1.0–1.2 |
 
 - 单线程时我们的版本更快，原因【推断】是上游每个事件多一次哈希表查找、一次 `shared_ptr` 复制和一次 `try_lock`。
-- 2 个及以上线程时上游更快。6–8 个线程时，按两边范围的端点计算，上游的合计吞吐是我们的 1.57–3.51 倍（按原始记录逐条计算的端点比值：最小值为 8 线程普通帧 2.44/1.55，最大值为 8 线程模块帧 3.63/1.04；用表中四舍五入后的数字计算会得到 3.49）。
+- 普通帧从 2 个线程起、模块帧从 4 个线程起，上游更快，两边范围不重叠；模块帧 2 个线程时范围重叠（上游 3.198–6.137，我们 2.927–3.278）。6–8 个线程时，按两边范围的端点计算，上游的合计吞吐是我们的 1.57–3.51 倍（按原始记录计算：最小值为 8 线程普通帧 2.441/1.550，最大值为 8 线程模块帧 3.631/1.036）。
 - 两个版本的合计吞吐都没有随线程数增长。【推断】上游的瓶颈是每个事件都要获取的全局 `results_mutex_`，我们的是 `data_mutex_`。
 - 限制：stub 用 `std::mutex` 模拟 `PyMutex`，不含真实 CPython 挂起、恢复线程的开销；stub 中计算 hash 用 `ostringstream`，开销与真实实现不同；测试机是共享服务器，同一配置 3 次运行之间最多相差约一倍（例如上游模块帧 2 线程 3.2–6.1）。**这些数字只能用来比较两个版本的相对趋势，不能代表真实环境下的开销。** 这组与 [fix_details.md](fix_details.md) 第 5.2 节那组是不同的 stub、不同的运行，不能互相换算。
 - 日志：`upstream-harness/logs/bench-20261102-042250.jsonl`，脚本 `run_bench.sh`。
@@ -599,33 +601,33 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 
 ## 7. 给接手工程师的建议
 
-### 7.1 第一步：向使用方确认配置和崩溃时机，补上 `b2e659d62f`，确认崩溃出在哪一处
+### 7.1 第一步：向使用方确认配置和崩溃时机，确认崩溃出在哪一处，补上 `b2e659d62f`
 
 按下面的顺序做。
 
-1. **向使用方要 profiler 配置和崩溃时机**：`with_stack`、`with_modules`、`profile_memory`、`record_shapes`，是否多线程，崩溃发生在开始采集、前向中，还是停止采集时（`prof.stop()` 或退出 `with` 块）。按第 1.5 节的对应关系，这一步可以排除一部分候选。
+1. **向使用方要 profiler 配置和崩溃时机**：`with_stack`、`with_modules`、`activities` 是否含 CPU（`tracePython()` 要求 `(with_stack || with_modules)` 且采集 CPU activity，`npu_profiler.cpp` 第 95–98 行）、`profile_memory`、`record_shapes`，是否多线程，崩溃发生在开始采集、前向中，还是停止采集时（`prof.stop()` 或退出 `with` 块）。按第 1.5 节的对应关系，这一步可以排除一部分候选。
 
-2. **在使用方原来的构建上运行最小脚本，确认候选 1、2。** 原来的构建指 `d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`。脚本用 3.14t，单线程，`with_stack=True`，包含 `nn.Module` 前向，并包含停止采集（退出 `with` 块），候选 2 才有机会出现。不要在本分支上做这一步：候选 2 在 `663e8ba` 中已改，补上 `b2e659d62f` 之后候选 1 也不存在，脚本不崩溃不能排除任何候选。
+2. **在使用方原来的构建上运行单线程最小脚本，检查候选 1。** 原来的构建指 `d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`。脚本用 3.14t，单线程，`with_stack=True`，采集 CPU activity，包含 `nn.Module` 前向，开启 `PYTHONFAULTHANDLER=1`。候选 1 成立时，进程在第一次前向时崩溃，到不了停止采集，所以这一步看不到候选 2。
 
-   使用方说"没有调用栈"，取得诊断信息有三种手段，建议按顺序使用：
+3. **在原来的构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分**（需要从源码编译），开启 `PYTHONMALLOC=debug`，重新运行并包含停止采集，检查候选 2。
 
-   - **`PYTHONFAULTHANDLER=1`（或 `python -X faulthandler`）**：SIGSEGV 时打印 Python 层调用栈，不需要 gdb，用来看崩溃发生在前向中还是停止采集时。【已验证，本机 3.14.3、3.14.3t，`py314-checks/crash_diag_check.out`】GIL 构建打印所有线程的 Python 调用栈；FT 构建只打印崩溃线程的 Python 调用栈，输出中有一行 `<Cannot show all threads while the GIL is disabled>`。两种构建在 3.14 上都另外打印崩溃线程的 C 调用栈，本机使用的 python-build-standalone 解释器在这部分只显示地址和少数符号名。
-   - **`PYTHONMALLOC=debug`**：安装 CPython 内存分配器的调试钩子。【已验证，同上】在没有 attach 线程状态的情况下调用 `PyObject_Free`，FT 构建立即以 `Fatal Python error: _PyMem_DebugFree: Python memory allocator called without an active thread state` 终止，GIL 构建的提示是 `called without holding the GIL`；不设这个环境变量时同一调用不报错。【推断】据此，候选 2（不持有 GIL 时经 `Py_DECREF` 释放对象，最终调用分配器的释放函数）在开启它之后会在释放的位置终止，这条释放路径本身没有运行验证；这与 issue #5658"开启 `PYTHONMALLOC=debug` 时必定出现 coredump"一致。这一检查只覆盖经过 CPython 分配器的释放；它对候选 3 中 C++ 对象的释放后访问没有作用，那部分要靠 ASan 构建。
-   - **gdb `bt`**：取得完整的 C++ 调用栈。读法如下：
-     - 栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 (1)（缺少 `b2e659d62f`）；
-     - 栈顶在 `_Py_Dealloc`、对象的 dealloc 函数或分配器中，往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者开启 `PYTHONMALLOC=debug` 后在这些位置报 `_PyMem_DebugFree` 错误，对应候选 (2)（issue #5658，原 `clear()` 在没有持有 GIL 的状态下释放 ctx）；
-     - 栈顶在上报链路（`DataDumper`、`RingBuffer`）或 profile 回调中，对应候选 (3)（三处竞态之一）；
-     - 栈顶在 pymalloc、mimalloc、`free` 中，或者在与 profiler 无关的代码中，通常是堆损坏【推断】：候选 2、3 都可能破坏堆，堆损坏时崩溃位置通常晚于出错位置。这时应开启 `PYTHONMALLOC=debug` 重新运行，再按上面几条判断。
+4. **在本分支上补同一处修改，编译本分支，运行多线程用例**，检查候选 3 和本分支的修复。本分支同样缺少 `b2e659d62f`，不补的话这一步会先遇到候选 1。
 
-3. **无条件补上 `b2e659d62f` 的 `PyMapping_GetItemString` 修改**（3.13 以下保留 `PyDict_GetItemString`），用 `THPObjectPtr` 持有返回的新引用。`PyMapping_GetItemString` 返回新引用，`PyDict_GetItemString` 返回借用引用，只替换函数名会造成引用泄漏。取不到时判空跳过（上游 `ff5ad88d8a` 的做法是取不到时抛 `KeyError`，由回调的 `catch (...)` 处理）。**不要整个 cherry-pick `b2e659d62f`**：它还在 `~ThreadLocalResult` 里用 `#if ... PY_MINOR_VERSION < 12` 跳过 `Py_DECREF(ctx_)`（提交中的注释原文是 "purposefully allowing for a small leak"），这一部分不要移植，因为本分支的 `clear()` 已改为持有 GIL 释放 ctx；它也没有对取到的 `self` 判空。
+   修改做法：3.13 以下保留 `PyDict_GetItemString`，3.13 及以上用 `PyMapping_GetItemString`，并用 `THPObjectPtr` 持有返回的新引用（`PyDict_GetItemString` 返回借用引用，只替换函数名会造成引用泄漏）；取不到时判空跳过（上游 `ff5ad88d8a` 的做法是取不到时抛 `KeyError`，由回调的 `catch (...)` 处理）。**不要整个 cherry-pick `b2e659d62f`**：它还在 `~ThreadLocalResult` 里用 `#if ... PY_MINOR_VERSION < 12` 跳过 `Py_DECREF(ctx_)`（提交中的注释原文是 "purposefully allowing for a small leak"），这一部分不要移植，因为本分支的 `clear()` 已改为持有 GIL 释放 ctx；它也没有对取到的 `self` 判空。按第 4.2 节已验证的 C API 行为，3.13 及以上 `PyDict_GetItemString` 必定返回 NULL，所以本分支上的这处修改不取决于第 2、3 步的结果，作为一个独立提交先做。
 
-   按第 4.2 节已验证的 C API 行为，3.13 及以上 `PyDict_GetItemString` 必定返回 NULL，所以这处修改不取决于第 2 步能否复现崩溃，作为一个独立提交先做。这一步和线程安全无关，不受后面选哪个方案影响。
+诊断手段：
 
-4. **补上之后，在本分支上再运行一次第 2 步的同一个脚本**，确认不再崩溃。
+- **`PYTHONFAULTHANDLER=1`（或 `python -X faulthandler`）**：SIGSEGV 时打印 Python 层调用栈，不需要 gdb，用来看崩溃发生在前向中还是停止采集时。【已验证，本机 3.14.3、3.14.3t，`py314-checks/crash_diag_check.out`，该输出经 `head -12` 截断】GIL 构建打印所有线程的 Python 调用栈；FT 构建只打印崩溃线程的，输出中有一行 `<Cannot show all threads while the GIL is disabled>`。
+- **`PYTHONMALLOC=debug`**：安装 CPython 内存分配器的调试钩子。【已验证，同上】在没有 attach 线程状态的情况下调用 `PyObject_Free`，FT 构建立即以 `Fatal Python error: _PyMem_DebugFree: Python memory allocator called without an active thread state` 终止，GIL 构建的提示是 `called without holding the GIL`；不设这个环境变量时同一调用不报错。【推断】据此，候选 2（不持有 GIL 时经 `Py_DECREF` 释放对象）在开启它之后会在释放的位置终止，这条释放路径本身没有运行验证；这与 issue #5658"开启 `PYTHONMALLOC=debug` 时必定出现 coredump"一致。它只覆盖经过 CPython 分配器的释放；候选 3 涉及的 C++ 对象经 glibc malloc 分配，要用 ASan 构建检查。
+- **gdb `bt`**：取得完整的 C++ 调用栈。读法如下：
+  - 栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 (1)（缺少 `b2e659d62f`）；
+  - 栈顶在 `_Py_Dealloc`、对象的 dealloc 函数或分配器中，往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者开启 `PYTHONMALLOC=debug` 后在这些位置报 `_PyMem_DebugFree` 错误，对应候选 (2)（issue #5658）；
+  - 栈顶在上报链路（`DataDumper`、`RingBuffer`）或 profile 回调中，对应候选 (3)（三处竞态之一）；
+  - 栈顶在 pymalloc、mimalloc、`free` 中，或者在与 profiler 无关的代码中，通常是堆损坏【推断】，崩溃位置通常晚于出错位置。开启 `PYTHONMALLOC=debug` 重新运行可以检查候选 2；候选 3 要用 ASan 构建检查。
 
 ### 7.2 问题 1、2：移植现有修改
 
-`ring_buffer.h`、`data_dumper.h/.cpp` 的修改可以移植到上游 master：上游这两处的逻辑与 2.13.0 相同，只做过 clang-format，所以补丁不能直接 `git apply`，需要手工合入；没有在 master 上编译过。采用的方案和放弃的方案见第 2、3 节。如果上游维护者不接受手写内存序，最接近的替代是读写锁（第 2.2 节），代价是多线程下 `Report` 调用速率下降（单位百万次/秒，中位数：8 线程 3.49 对 3.98，32 线程 3.06 对 3.78），即业务线程在 `Report` 中停留的时间更长。在本机测量中它的接受速率不低于采用方案（8 线程 2.35 对 2.08，范围不重叠；32 线程 1.46 对 1.33，范围重叠）。
+`ring_buffer.h`、`data_dumper.h/.cpp` 的修改可以移植到上游 master：上游这两处的逻辑与 2.13.0 相同，只做过 clang-format，所以补丁不能直接 `git apply`，需要手工合入；没有在 master 上编译过。采用的方案和放弃的方案见第 2、3 节。如果上游维护者不接受手写内存序，最接近的替代是读写锁（第 2.2 节）。本机测量不能区分它与采用方案的单次调用开销（第 2.7 节）。
 
 ### 7.3 问题 3：建议以上游 `ff5ad88d8a` 为基础
 
@@ -633,7 +635,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 
 1. **维护成本。** 上游已经合入了自己的重构，我们的补丁改的是重构之前的结构，与上游 master 冲突，不能直接合入。继续维护两套写法，以后每次同步上游都要重新合并。
 2. **结构更简单。** 一把控制锁覆盖全部五个入口，`startOne` 与 `stop()` 完全依次执行，不需要 `session_` 计数和重试，也没有"两轮 stop/start 期间漏采一个线程"的限制。回调写的是本线程的对象，生命周期由 `shared_ptr` 和 `callback_mutex_` 保证，比"回调只能在第一次等锁前读 ctx"这类约束更容易检查。
-3. **争用更少。** 缓存和事件不经过全局锁，全局锁只剩一次短临界区。stub 环境下，2 个及以上线程时上游的回调吞吐更高（第 5.4 节）。如果要进一步减少争用，可以把 `findThreadLocalResult` 改为线程局部缓存（按会话编号校验），这一步上游没有做，本文也没有实现。
+3. **争用更少。** 缓存和事件不经过全局锁，全局锁只剩一次短临界区。stub 环境下，多线程时上游的回调吞吐更高（模块帧 2 个线程时范围重叠，第 5.4 节）。如果要进一步减少争用，可以把 `findThreadLocalResult` 改为线程局部缓存（按会话编号校验），这一步上游没有做，本文也没有实现。
 4. **已包含 3.13+ 的 `PyMapping_GetItemString` 修改和 #5658 的修改。**
 
 合入 2.13.0 或 r22 分支时建议同时做的修改：
@@ -647,7 +649,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 
 ## 8. 未解决的问题
 
-- **使用方的崩溃到底出在哪一处，没有确定。** 候选有三个（见第 1.5 节）：第 4.2 节的空指针访问（缺少 `b2e659d62f`）；issue #5658 所述路径，原 `clear()` 在没有持有 GIL 的状态下 `Py_DECREF` `TraceContext`（本分支已改）；三个竞态中的某一处。前两个在单线程、有 GIL 时同样成立。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（第 1.5 节）。确定根因的手段见第 7.1 节：`PYTHONFAULTHANDLER=1`、`PYTHONMALLOC=debug`、gdb `bt`。
+- **使用方的崩溃到底出在哪一处，没有确定。** 候选有三个（见第 1.5 节）：第 4.2 节的空指针访问（缺少 `b2e659d62f`）；issue #5658 所述路径，原 `clear()` 在没有持有 GIL 的状态下 `Py_DECREF` `TraceContext`（本分支已改）；三个竞态中的某一处。前两个在单线程、有 GIL 时同样成立。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（第 1.5 节）。确定根因的步骤和手段见第 7.1 节。
 - 没有用真实的 torch、CPython 3.14t 头文件编译任何一个版本；没有在 NPU 上运行。
 - 第 4.2 节的崩溃路径只验证了 CPython C API 的行为，没有运行 torch_npu。
 - 上游 PR 的"功能验证"截图没有查看；上游是否有针对 FT 的测试没有核实。

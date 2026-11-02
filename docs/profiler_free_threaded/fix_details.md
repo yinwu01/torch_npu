@@ -8,7 +8,7 @@
 - **先看两件和线程无关的事。** 使用方崩溃的根因没有确定，三个候选中有两个在单线程、有 GIL 时同样成立：
   - 本分支的基线缺少上游 `b2e659d62f`，在 CPython 3.13 及以上读取 `nn.Module` 帧的 `self` 会得到空指针，随后对空指针取属性（详见 [analysis.md](analysis.md) 第 4.2 节）；
   - 上游 issue #5658 所述路径：原 `clear()` 在没有持有 GIL 的状态下 `Py_DECREF` `TraceContext`，调用方 `stopNpuProfiler()` 先执行了 `gil_scoped_release`。本分支的 `clear()` 已改为先取 GIL 再释放（见第 3 节问题 3）。
-  - 第三个候选是下面三处竞态中的某一处。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（[analysis.md](analysis.md) 第 1.5 节）。接手后先向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）和崩溃发生的时间点，再按第 7 节和 [analysis.md](analysis.md) 第 7.1 节的步骤处理。
+  - 第三个候选是下面三处竞态中的某一处。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（[analysis.md](analysis.md) 第 1.5 节）。接手后按第 7 节第 1 步（即 [analysis.md](analysis.md) 第 7.1 节）处理。
 
 ## 1. 结论
 
@@ -262,7 +262,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ### 4.4 审阅
 
-修改过程中做了三轮代码审阅，每轮两位审阅者。本文在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成 `docs/profiler_free_threaded/` 之后，与本目录其他四个文件一起又经过两轮文档审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工代码审阅。**
+修改过程中做了三轮代码审阅，每轮两位审阅者。本文在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成 `docs/profiler_free_threaded/` 之后，与本目录其他四个文件一起经过三轮文档审阅，第三轮审阅意见已修改，修改后未再经独立审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工代码审阅。**
 
 - **第一、二轮**共提出 21 条意见：16 条修改了代码或测试，2 条更正了报告措辞，1 条在代码注释中说明（槽位内存增加），2 条只做了性能测量、没有改代码（`writers_` 计数开销、`with_stack` 锁争用，见第 5 节）。其中几个问题是前一轮修复本身引入的：
   - 两个线程同时 `Stop`；
@@ -314,7 +314,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调通过 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。如果 worker 在 profiler 启动前已经创建，其算子不会被记录。worker 的数量和创建时机没有核实。影响是结果缺少这些线程的算子数据，没有观察到崩溃 |
-| 基线缺少上游 `b2e659d62f`，3.13+ 读取 `self` 得到空指针 | 和线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已核实，torch_npu 上的崩溃未核实。接手后在第 7 节第 1 步中补上这处修改，做法见 [analysis.md](analysis.md) 第 7.1 节，背景见 [analysis.md](analysis.md) 第 4.2 节 |
+| 基线缺少上游 `b2e659d62f`，3.13+ 读取 `self` 得到空指针 | 和线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已核实，torch_npu 上的崩溃未核实。接手后在第 7 节第 1 步的第 4 小步中补上这处修改，做法见 [analysis.md](analysis.md) 第 7.1 节，背景见 [analysis.md](analysis.md) 第 4.2 节 |
 | `with_stack` 在 FT 下的锁争用 | 彻底解决需要改为每个线程一份事件缓冲和缓存。上游 master 已采用这种结构（见第 1 节）。上游这种结构下每个事件仍要获取一次全局 `results_mutex_`，只是次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.5、5.4 节 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 存在竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能正在 `IsMstxDomainEnabled` 中读取 |
 | `ProfilerMgr` 的其他非原子成员 | `path_`、`profConfig_` 等在 `Start/Stop/Init/Finalize` 中写入；多个线程同时调用这些控制函数时没有保护 |
@@ -324,18 +324,18 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 7. 接手后的步骤
 
-1. **确认崩溃出在哪一处，并补上 `b2e659d62f`。**
-   - 先向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点（开始采集、前向中、停止采集时）。按 [analysis.md](analysis.md) 第 1.5 节，这一步可以排除一部分候选。
-   - 在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 3.14t 运行一个单线程、`with_stack=True`、含 `nn.Module` 前向并包含停止采集（退出 `with` 块）的最小脚本，开启 `PYTHONFAULTHANDLER=1`，需要时加 `PYTHONMALLOC=debug`，确认候选 1、2。不要在本分支上做这一步：候选 2 已在 `663e8ba` 中修改，补上 `b2e659d62f` 之后候选 1 也不存在，脚本不崩溃不能排除任何候选。
-   - **无条件补上 `b2e659d62f` 的 `PyMapping_GetItemString` 修改**（3.13 以下保留 `PyDict_GetItemString`），用 `THPObjectPtr` 持有返回的新引用，取不到时判空跳过；不移植 `~ThreadLocalResult` 在 3.12+ 跳过 `Py_DECREF` 的部分，原因是本分支 `clear()` 已改为持有 GIL 释放 ctx。按 [analysis.md](analysis.md) 第 4.2 节已验证的 C API 行为，3.13 及以上 `PyDict_GetItemString` 必定返回 NULL，所以这处修改不取决于能否复现崩溃。
-   - 补上之后，在本分支上再运行一次同一个脚本，确认不再崩溃。详见 [analysis.md](analysis.md) 第 7.1 节。
+1. **确认崩溃出在哪一处，并补上 `b2e659d62f`。** 按下面的顺序做，详见 [analysis.md](analysis.md) 第 7.1 节：
+   1. 向使用方要 profiler 配置（`with_stack`、`with_modules`、`activities` 是否含 CPU、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点（开始采集、前向中、停止采集时）。
+   2. 在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`。第一次前向时崩溃，对应候选 1。
+   3. 在原来的构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分（需要从源码编译），开启 `PYTHONMALLOC=debug`，重新运行并包含停止采集，检查候选 2。
+   4. 在本分支上补同一处修改（3.13 以下保留 `PyDict_GetItemString`，用 `THPObjectPtr` 持有返回的新引用，取不到时判空跳过；不移植 `~ThreadLocalResult` 在 3.12+ 跳过 `Py_DECREF` 的部分），作为独立提交，不取决于第 2、3 步的结果；然后编译本分支，运行多线程用例，检查候选 3 和本分支的修复。
 2. **决定合入方式。**
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master：上游这两处的逻辑与 2.13.0 相同。上游做过 clang-format 格式化，补丁不能直接 `git apply`，需要手工合入；没有在 master 上编译过。
    - 问题 3 建议以上游 `ff5ad88d8a` 的方案为基础：它按线程存放缓存和事件，全局锁的获取次数比我们方案少、持有时间短（全局锁仍在：FT 构建下每个事件仍要获取一次 `results_mutex_`）；代价是依赖 CPython 私有 API `_PyEval_StopTheWorld`，并且同线程重入时会死锁。两套方案的逐项对照、上游方案在本仓库压力测试下的运行结果，以及合入时建议补的四处修改，见 [analysis.md](analysis.md) 第 4.8、7.3 节。
 3. **编译。** 在 NPU 机器上按 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的"Build and enable deliberately"一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的"Build and wheel identity"一节，分别编译 GIL 版和 FT 版。
 4. **FT 版验证。** 运行一次多线程推理并开启 `torch_npu.profiler`，建议覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置。确认不再崩溃，并且能正常导出结果。
 5. **GIL 版验证。** 运行原有的 profiler 测试（`test/profiler/`），确认有 GIL 时行为不变。
-6. **如果仍然崩溃。** 先用 `PYTHONFAULTHANDLER=1` 获取 Python 层调用栈（FT 构建只打印崩溃线程的），看崩溃发生在前向中还是停止采集时；再用 `PYTHONMALLOC=debug` 运行，让不持有线程状态时的对象释放在释放的位置终止（`PyObject_Free` 已在本机 3.14.3、3.14.3t 上验证，经 `Py_DECREF` 的释放路径属于推断）；最后用 gdb 获取 C++ 调用栈（`bt`）。如果栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 (1)；如果栈顶在 `_Py_Dealloc`、对象的 dealloc 函数或分配器中，往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，对应候选 (2)；栈顶在上报链路或 profile 回调中，对应候选 (3)。栈顶在 pymalloc、mimalloc、`free` 或与 profiler 无关的代码中时，通常是堆损坏【推断】，崩溃位置不等于出错位置，应开启 `PYTHONMALLOC=debug` 重新运行（候选 3 中问题 1 的释放后访问和重复释放，在本仓库压力测试的 ASan 构建中对原代码复现过，见第 4.2 节）。读法详见 [analysis.md](analysis.md) 第 7.1 节。
+6. **如果仍然崩溃。** 先用 `PYTHONFAULTHANDLER=1` 获取 Python 层调用栈（FT 构建只打印崩溃线程的），看崩溃发生在前向中还是停止采集时；再用 `PYTHONMALLOC=debug` 运行，让不持有线程状态时经 CPython 分配器的释放在释放的位置终止（`PyObject_Free` 已在本机 3.14.3、3.14.3t 上验证，经 `Py_DECREF` 的释放路径属于推断；它对候选 3 中经 glibc malloc 分配的 C++ 对象没有作用，候选 3 要用 ASan 构建检查）；最后用 gdb 获取 C++ 调用栈（`bt`）。如果栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 (1)；如果栈顶在 `_Py_Dealloc`、对象的 dealloc 函数或分配器中，往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，对应候选 (2)；栈顶在上报链路或 profile 回调中，对应候选 (3)。栈顶在 pymalloc、mimalloc、`free` 或与 profiler 无关的代码中时，通常是堆损坏【推断】，崩溃位置不等于出错位置，开启 `PYTHONMALLOC=debug` 重新运行可以检查候选 2，候选 3 要用 ASan 构建检查（候选 3 中问题 1 的释放后访问和重复释放，在本仓库压力测试的 ASan 构建中对原代码复现过，见第 4.2 节）。读法详见 [analysis.md](analysis.md) 第 7.1 节。
 
 ## 8. 改动文件
 

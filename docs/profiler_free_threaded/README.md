@@ -1,6 +1,12 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全
 
-使用方在 free-threaded CPython 3.14（去掉 GIL 的构建，下文简称 FT）下开启 `torch_npu.profiler` 时进程 SIGSEGV，没有调用栈。我们静态阅读上报链路，找到三处线程安全问题（停止采集时写入方仍在访问正在被销毁的环形缓冲区；多个写入方同时写入时读取方可能读到尚未写完的槽位；`PythonTracer` 的共享状态没有同步），在分支 `fix/profiler-thread-safety` 上修复，并写了一套 stub 环境的压力测试：原代码 42 次场景运行全部失败，修复后 42 次全部通过。做上游对照时另外发现两处在单线程、有 GIL 时同样成立的问题（其中一处本分支已修改）。**接手后请按顺序做四件事**：(1) 向使用方要 profiler 配置（`with_stack`、`with_modules`、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点；(2) 在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 CPython 3.14t 运行一个单线程、`with_stack=True`、含 `nn.Module` 前向并包含停止采集（退出 `with` 块）的最小脚本，开启 `PYTHONFAULTHANDLER=1`，需要时再加 `PYTHONMALLOC=debug`，确认崩溃是否出在候选 1 或候选 2；(3) 无条件补上上游 `b2e659d62f` 中 `PyMapping_GetItemString` 的那部分修改；(4) 补上之后在本分支上再运行一次同一个脚本，确认不再崩溃。第 (2) 步不能在本分支上做，原因和确认方法见 [analysis.md](analysis.md) 第 1.5、4.2、7.1 节。所有修改都只在 stub 环境中验证过，没有用真实 torch、CPython 3.14t、CANN 头文件编译，也没有在 NPU 上运行。
+- **问题。** 使用方在 free-threaded CPython 3.14（去掉 GIL 的构建，下文简称 FT）下开启 `torch_npu.profiler` 时进程 SIGSEGV，没有调用栈。
+- **已做的工作。** 静态阅读上报链路，找到三处线程安全问题（停止采集时写入方仍在访问正在被销毁的环形缓冲区；多个写入方同时写入时读取方可能读到尚未写完的槽位；`PythonTracer` 的共享状态没有同步），在分支 `fix/profiler-thread-safety` 上修复。stub 环境的压力测试：原代码 42 次场景运行全部失败，修复后 42 次全部通过。做上游对照时另外发现两处在单线程、有 GIL 时同样成立的问题（其中一处本分支已修改）。所有修改都只在 stub 环境中验证过，没有用真实 torch、CPython 3.14t、CANN 头文件编译，也没有在 NPU 上运行。
+- **接手后的步骤**（理由见 [analysis.md](analysis.md) 第 1.5、7.1 节）：
+  1. 向使用方要 profiler 配置（`with_stack`、`with_modules`、`activities` 是否含 CPU、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生的时间点。
+  2. 在使用方原来的构建（`d3216c2` 或使用方实际使用的 wheel，不含本分支的修改，也不含 `b2e659d62f`）上，用 CPython 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`。第一次前向时崩溃，对应候选 1。
+  3. 在原来的构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分（需要从源码编译），开启 `PYTHONMALLOC=debug`，重新运行并包含停止采集（`prof.stop()` 或退出 `with` 块），检查候选 2。
+  4. 在本分支上补同一处修改（独立提交，不取决于第 2、3 步的结果），编译本分支，运行多线程用例，检查候选 3 和本分支的修复。
 
 使用方崩溃的根因没有确定，有三个候选，详见 [analysis.md](analysis.md) 第 1.5、7.1、8 节：
 
@@ -8,7 +14,7 @@
 2. 上游 issue #5658 所述路径：原 `clear()` 在没有持有 GIL 的状态下 `Py_DECREF` `TraceContext`（本分支的 `clear()` 已改为先取 GIL 再释放）；
 3. 上面三处竞态中的某一处。
 
-候选 1、2 都在单线程、有 GIL 时成立，候选 3 只在并发时成立。在不知道使用方配置和崩溃时机的情况下三者无法排序，知道之后可以排除一部分（推断，见 [analysis.md](analysis.md) 第 1.5 节）：候选 1、2 都要求开启 `with_stack` 或 `with_modules`，两项都没开时只剩候选 3；在 3.13 及以上，只要采集期间调用过 `nn.Module`，候选 1 在第一次前向时就会发生，早于停止采集。确定根因的手段有三种（[analysis.md](analysis.md) 第 7.1 节）：`PYTHONFAULTHANDLER=1` 在 SIGSEGV 时打印 Python 层调用栈（FT 构建只打印崩溃线程的）；`PYTHONMALLOC=debug` 让不持有线程状态时的对象释放在释放的位置终止；gdb `bt` 取得 C++ 调用栈。
+候选 1、2 都在单线程、有 GIL 时成立，候选 3 只在并发时成立。知道使用方配置和崩溃时机之后可以排除一部分（推断，见 [analysis.md](analysis.md) 第 1.5 节）：候选 1、2 都要求开启 `with_stack` 或 `with_modules` 并采集 CPU activity，否则 `PythonTracer` 不启动，只剩候选 3 中的问题 1、2；在 3.13 及以上，只要采集期间调用过 `nn.Module`，候选 1 在第一次前向时就会发生，早于停止采集。诊断手段（[analysis.md](analysis.md) 第 7.1 节）：`PYTHONFAULTHANDLER=1` 在 SIGSEGV 时打印 Python 层调用栈（FT 构建只打印崩溃线程的）；`PYTHONMALLOC=debug` 在不持有线程状态时调用 CPython 分配器的释放函数时终止进程（经 `Py_DECREF` 释放 ctx 的路径属于推断），对候选 3 中 C++ 对象的释放没有作用，候选 3 要用 ASan 构建；gdb `bt` 取得 C++ 调用栈。
 
 ## 术语
 
@@ -28,9 +34,9 @@
 | 三处线程安全问题的定位和修改 | 已完成 | `663e8ba`、`f36d74d` |
 | stub 环境的压力测试 | 已完成 | 原代码 42/42 失败，修复后 0/42 失败 |
 | 候选方案对比、与上游 `ff5ad88d8a` 的对照 | 已完成 | 见 [analysis.md](analysis.md) |
-| 本文档目录 | 进行中 | 2026-11-02 整理，未提交 |
-| 向使用方要 profiler 配置和崩溃时间点；在使用方原来的构建上运行最小脚本 | 待办 | 接手后的第 (1)(2) 步，做法见 [analysis.md](analysis.md) 第 1.5、7.1 节 |
-| 补上游 `b2e659d62f` 的 `PyMapping_GetItemString` 部分 | 待办 | 接手后的第 (3) 步，不取决于第 (2) 步的结果，做法见 [analysis.md](analysis.md) 第 7.1 节 |
+| 本文档目录 | 进行中 | 快照已提交为 `87dcd0e`；第三轮审阅意见的修改未提交 |
+| 向使用方要 profiler 配置和崩溃时间点；在使用方原来的构建上运行最小脚本 | 待办 | 接手后的第 1 至 3 步，做法见 [analysis.md](analysis.md) 第 1.5、7.1 节 |
+| 在本分支补上游 `b2e659d62f` 的 `PyMapping_GetItemString` 部分 | 待办 | 接手后的第 4 步，不取决于第 2、3 步的结果，做法见 [analysis.md](analysis.md) 第 7.1 节 |
 | 用真实 torch、CPython 3.14t、CANN 头文件编译，并在 NPU 上验证 | 待办 | 见 [fix_details.md](fix_details.md) 第 7 节 |
 | 问题 3 的合入方式：继续用我们的写法，还是改用上游 `ff5ad88d8a` | 待办 | 需要接手的工程师或上游维护者决定，对照和建议见 [analysis.md](analysis.md) 第 4.8、4.11、7.3 节 |
 | `fix_details.md` 第 6 节列出的其他未处理问题 | 待办 | 同节 |
@@ -80,4 +86,4 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 交付状态
 
-代码部分经过三轮审阅（每轮两位审阅者）。原交接文档（即 `fix_details.md`）在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成本目录之后，五个文件又一起经过两轮文档审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工审阅。**
+代码部分经过三轮审阅（每轮两位审阅者）。原交接文档（即 `fix_details.md`）在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成本目录之后，五个文件一起经过三轮文档审阅，第三轮审阅意见已修改，修改后未再经独立审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工审阅。**
