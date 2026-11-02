@@ -2,14 +2,14 @@
 
 - **问题。** 使用方在 free-threaded CPython 3.14（去掉 GIL 的构建，下文简称 FT）下开启 `torch_npu.profiler` 时进程 SIGSEGV，没有调用栈。
 - **已做的工作。** 静态阅读上报链路，找到三处线程安全问题（停止采集时写入方仍在访问正在被销毁的环形缓冲区；多个写入方同时写入时读取方可能读到尚未写完的槽位；`PythonTracer` 的共享状态没有同步），在分支 `fix/profiler-thread-safety` 上修复。stub 环境的压力测试：原代码 42 次场景运行全部失败，修复后 42 次全部通过。做上游对照时另外发现两处在单线程、有 GIL 时同样成立的问题（其中一处本分支已修改）。所有修改都只在 stub 环境中验证过，没有用真实 torch、CPython 3.14t、CANN 头文件编译，也没有在 NPU 上运行。
-- **接手后的步骤**（理由见 [analysis.md](analysis.md) 第 1.5、7.1 节）。准备：NPU 机器、CANN、面向 CPython 3.14t 编译的 torch；编译方法见 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的“Build and enable deliberately”一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的“Build and wheel identity”一节。使用方只有 wheel、没有对应源码时，用 `d3216c2` 的源码编译一份作为下文的“原构建”。
+- **接手后的步骤**（理由见 [analysis.md](analysis.md) 第 1.5、7.1 节）。准备：NPU 机器、CANN，与 CPython 3.14t ABI 匹配的 PyTorch 2.13.0（下面链接的文档没有说明 torch 本身的编译）。torch_npu 的编译方法见 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的“Build and enable deliberately”一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的“Build and wheel identity”一节，GIL 版和 FT 版分别编译。下文的“原构建”指不含本分支修改、也不含 `b2e659d62f` 的构建：第 2 步优先用使用方实际使用的 wheel（它是否基于 `d3216c2` 没有核实）；第 3 步需要改源码，用 `d3216c2` 的源码编译。每一步都按 gdb `bt` 的栈顶或 ASan 报告的位置判断原因，不按是否崩溃判断；竞态按概率出现，多线程用例要重复运行。
 
   1. **向使用方要配置和崩溃时机。** profiler 配置（`with_stack`、`with_modules`、`activities` 是否含 CPU、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生在开始采集、前向中，还是停止采集时。
-  2. **在原构建上检查候选 1。** 原构建不含本分支的修改，也不含 `b2e659d62f`。用 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`，并在 gdb 下运行。第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。只看到前向崩溃不足以区分候选 1 和候选 3 中的问题 2（单个 Python 线程时仍有 C++ 写入线程）。候选 1 成立时，进程不会执行到停止采集，所以这一步看不到候选 2。
+  2. **在原构建上检查候选 1。** 用 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`，并在 gdb 下运行。第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。只看到前向崩溃不足以区分候选 1 和候选 3 中的问题 2（单个 Python 线程时仍有 C++ 写入线程）。候选 1 成立时，进程不会执行到停止采集，所以这一步看不到候选 2。
   3. **在原构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分，重新编译，然后：**
-     1. 重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。前向不再崩溃，即确认候选 1；停止采集时终止，对应候选 2。
-     2. 在同一构建上，按使用方的线程数运行多线程用例（有条件时用 ASan 构建）。这一构建仍含三处竞态，用来检查候选 3。
-  4. **在本分支上补同一处修改（独立提交），编译本分支，运行第 3.2 步的同一个多线程用例，确认本分支的修复。** 本分支同样缺少 `b2e659d62f`，不补的话会先遇到候选 1。
+     1. 在 gdb 下重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。第 2 步在前向时崩溃、这里不再崩溃，即确认候选 1。如果停止采集时终止：栈顶往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者报 `_PyMem_DebugFree` 错误，对应候选 2；栈顶在 `DataDumper`、`RingBuffer` 中，对应候选 3 的问题 1。
+     2. 在同一构建上，用使用方的负载或等价的多线程脚本（按使用方的线程数）重复运行，有条件时用 ASan 构建。先关闭 `with_stack` 和 `with_modules` 运行一组：这时 `PythonTracer` 不启动，只剩候选 3 的问题 1、2；再按使用方的配置运行一组。按栈顶或 ASan 报告的位置判断归属。
+  4. **在本分支上补同一处修改（独立提交），编译本分支，用第 3.2 步的同一组用例、同样的重复次数运行。** 只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认本分支的修复。另外覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置，确认能正常导出结果。本分支同样缺少 `b2e659d62f`，如果不补，会先遇到候选 1。
 
 使用方崩溃的根因没有确定，有三个候选，详见 [analysis.md](analysis.md) 第 1.5、7.1、8 节：
 
@@ -90,4 +90,4 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 交付状态
 
-代码部分经过三轮审阅（每轮两位审阅者）。原交接文档（即 `fix_details.md`）在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成本目录之后，五个文件一起经过四轮文档审阅；第四轮审阅意见已修改，修改后未再经独立审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工审阅。**
+代码部分经过三轮审阅（每轮两位审阅者）。原交接文档（即 `fix_details.md`）在 `675f2e9`、`da752e6` 期间经过两轮文档审阅；整理成本目录之后，五个文件一起经过五轮文档审阅；第五轮审阅意见已修改，修改后未再经独立审阅。**这些审阅和对应的修复都由 AI 模型子代理完成，没有人工审阅。**

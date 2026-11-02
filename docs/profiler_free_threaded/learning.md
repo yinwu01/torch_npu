@@ -5,7 +5,7 @@
   - A 部分：看懂、维护这次修改需要的背景知识，每条附官方出处；
   - B 部分：这次修复过程中有记录可查的经验。
 - 所有出处的访问日期都是 2026-11-02。CPython 源码以当天 `python/cpython` 的 `3.14` 和 `3.13` 分支为准。
-- 本文是文档，没有运行时依赖。整理后与本目录其他四个文件一起经过四轮文档审阅（AI 模型子代理，没有人工审阅）；第四轮审阅意见已修改，修改后未再经独立审阅。
+- 本文是文档，没有运行时依赖。整理后与本目录其他四个文件一起经过五轮文档审阅（AI 模型子代理，没有人工审阅）；第五轮审阅意见已修改，修改后未再经独立审阅。
 - **B 部分引用的证据路径（`/SSD1/wuyin/project/torch_npu-work/…`）都在作者本机，没有上传 GitHub，接手的工程师无法打开。** 保留这些路径是为了说明每条经验的依据出自哪里；审阅意见本身未公开。
 - **B 部分提到的"审阅者""实现者""修复者"都是 AI 模型子代理，这次没有人工代码审阅。**
 
@@ -35,7 +35,7 @@
 
 - **是什么。**
   - `Py_GIL_DISABLED`：FT 构建中定义为 1，GIL 构建中不定义。扩展代码用 `#ifdef Py_GIL_DISABLED` 区分两种构建。
-  - 声明支持：多阶段初始化的模块在模块定义里加 `{Py_mod_gil, Py_MOD_GIL_NOT_USED}`；单阶段初始化的模块调用 `PyUnstable_Module_SetGIL()`。不声明的话，导入时打印警告并在运行时开启 GIL。
+  - 声明支持：多阶段初始化的模块在模块定义里加 `{Py_mod_gil, Py_MOD_GIL_NOT_USED}`；单阶段初始化的模块调用 `PyUnstable_Module_SetGIL()`。如果不声明，导入时打印警告并在运行时开启 GIL。
 - **为什么有关。** torch_npu 只有在声明支持后才会在真正无 GIL 的状态下运行，这也是问题暴露的前提。我们新增的锁只在 `Py_GIL_DISABLED` 下启用，GIL 构建中编译为空函数。
 - **在代码里的位置。**
   - 声明：`torch_npu/csrc/InitNpuBindings.cpp:247`，`PyUnstable_Module_SetGIL(result, Py_MOD_GIL_NOT_USED)`，只在同时定义了 `Py_GIL_DISABLED` 和 `TORCH_NPU_EXPERIMENTAL_FREE_THREADED` 时编译。这段是 r22 分支原有的代码，我们没有改。
@@ -296,7 +296,7 @@
 
 1. stub 里加两个开关：在 `PyEval_SetProfile*` 替换回调之前执行一个回调（模拟审计回调）；让 `py::object::attr` 可注入异常（这两条是最终审阅者的建议，尚未实施）。
 2. stub 在模拟一个 C API 时，如果真实实现会对非法输入报错或崩溃，stub 也要能表现出来，否则调用方缺少判空的问题测不出来。
-3. 在有真实 torch 和 CPython 3.14t 的机器上至少编译一次，并运行一次 GIL 构建的原有 profiler 测试（[fix_details.md](fix_details.md) 第 7 节第 3–5 步）。
+3. 在有真实 torch 和 CPython 3.14t 的机器上至少编译一次，并运行一次 GIL 构建的原有 profiler 测试（[fix_details.md](fix_details.md) 第 7 节的“准备”段和第 7.2 节“GIL 版验证”）。
 
 ### B4. 设计之前没有查上游最新代码
 

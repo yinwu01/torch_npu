@@ -7,7 +7,7 @@
 - 标注约定：**【已验证】** 表示读过原文、运行过命令或测试；**【推断】** 表示只根据阅读代码得出，没有运行验证。没有标注的句子是代码事实或本文的组织性说明。
 - **文中引用的日志路径（`/SSD1/wuyin/project/torch_npu-work/…`）都在作者本机，没有上传 GitHub，接手的工程师无法打开。** 保留这些路径是为了说明每个数字出自哪一次运行。第 6.5 节列出的脚本（变体生成、基准、上游对照、`py314-checks/` 下的脚本）同样只在作者本机，没有进仓库，**所以本文第 2、3、5 节的数字、第 7.3 节建议的依据都无法由他人复现**。第 7.3 节第 4 条建议把这套测试整理进仓库，本次交付没有做。
 - 本文所用测试工具的运行依赖：Linux，g++ 11.4（C++17，支持 `-fsanitize=thread`、`-fsanitize=address`），Python 3.8 以上（只用标准库），`systemd-run --user`。不需要 torch、CANN、NPU，不需要联网。第 4.2 节的 CPython 行为核对另外用了 CPython 3.14.3、3.14.3t（python-build-standalone 构建，解包在 `torch_npu-work/py314/`）和 CPython 3.12.13（本机已有的解释器，来源未记录）。
-- 审阅：本目录五个文件在整理后经过四轮文档审阅（AI 模型子代理，没有人工审阅）；第四轮审阅意见已修改，修改后未再经独立审阅。
+- 审阅：本目录五个文件在整理后经过五轮文档审阅（AI 模型子代理，没有人工审阅）；第五轮审阅意见已修改，修改后未再经独立审阅。
 
 ## 术语
 
@@ -146,8 +146,8 @@
 - **内存。** 每个上报器 8 字节计数，按 64 字节对齐。
 - **复杂度。** 中等。正确性依赖 `seq_cst`，改弱后在 x86 和 TSan 下都测不出（[fix_details.md](fix_details.md) 第 4.5 节的变异 25 次运行全部通过）。
 - **行为变化。** `Stop` 中忙等写入方退出；fork 出的子进程如果继承了大于 0 的 `writers_`，`Stop` 会一直等待（[fix_details.md](fix_details.md) 第 6 节）。
-- **实测。** 只有单线程一行可以比较（丢弃比例接近 0）：采用方案 4.48 到 5.13（4.86），参照变体（只去掉 `writers_` 登记和 `WaitWriters` 等待，不是有效修复）2.57 到 5.50（4.66），范围重叠。8、32 线程的调用速率受丢弃比例影响，不用于比较（第 2.7 节）。修复提交之前的一轮测量（`torch_npu-work/tsan-logs/round2/bench-report-writers.log`，同一机器，每组 3 次）中，8 线程和 32 线程两组范围重叠；单线程一组范围不重叠，有 `writers_` 为 4.32 到 4.73，无 `writers_` 为 4.91 到 4.93，有 `writers_` 的一侧较慢。
-- **为什么采用。** 依据是设计推理：`Report` 路径不取锁，只多两次原子读-改-写；改动只限 `data_dumper.h/.cpp`，`ProfilerMgr` 和调用方不需要修改。本节的测量在修复提交之后进行（见文首），不能区分它与读写锁的单次调用开销（第 2.7 节）。
+- **实测。** 只有单线程一行可以比较（丢弃比例接近 0）：采用方案 4.48 到 5.13（4.86），参照变体（只去掉 `writers_` 登记和 `WaitWriters` 等待，不是有效修复）2.57 到 5.50（4.66），范围重叠。8、32 线程的调用速率受丢弃比例影响，不用于比较（第 2.7 节）。修复提交之前的一轮测量（`torch_npu-work/tsan-logs/round2/bench-report-writers.log`，同一机器，每组 3 次）中，单线程一组范围不重叠，有 `writers_` 为 4.32 到 4.73，无 `writers_` 为 4.91 到 4.93，有 `writers_` 的一侧较慢。
+- **为什么采用。** 依据是设计推理：`Report` 路径不取锁，只多两次原子读-改-写；改动只限 `data_dumper.h/.cpp`，`ProfilerMgr` 和调用方不需要修改。第 2.7 节的测量在修复提交之后，不能区分它与读写锁的单次调用开销；02:33 的一轮测量在修复提交之前（见文首）。
 
 ### 2.6 候选 F：每个写入线程一个缓冲区
 
@@ -156,7 +156,7 @@
 - **内存。** 线程数乘以每线程容量。按现在的容量（2^20 槽位，Vyukov 格式 16 MB）每个线程一份不可接受，需要另定更小的每线程容量；容量减小后，单个线程短时间内大量上报时更容易写满丢弃。
 - **复杂度。** 高：要处理线程退出时缓冲区的归属、采集之间的注册表重置、读取方的轮询策略。
 - **行为变化。** 同一线程内的记录顺序保持；不同线程之间的写入先后顺序不再保留（采用的方案按占用槽位的顺序取出）。下游解析是否依赖跨线程顺序，没有核实。
-- **结论。** 放弃。它同时解决问题 1 和问题 2 的争用，但改动范围和内存代价都大于这次修复的需要；第 2.7 节单线程一行中，`writers_` 的开销没有超出本机噪声（较早一轮的单线程测量显示出差别，见第 2.5 节）。如果将来在真实 NPU 场景中测出 `writers_` 争用明显，这是下一步可以考虑的方向。
+- **结论。** 放弃。它同时解决问题 1 和问题 2 的争用，但改动范围和内存代价都大于这次修复的需要；多线程下 `writers_` 的争用开销，本机数据无法测出（第 2.7 节）；单线程下它的开销在本轮测量中没有超出噪声，较早一轮显示出差别（第 2.5 节）。如果将来在真实 NPU 场景中测出 `writers_` 争用明显，这是下一步可以考虑的方向。
 
 ### 2.7 实测：`Report` 基准
 
@@ -233,7 +233,7 @@
 - **内存。** 每槽位从 8 字节增至 16 字节；两个 2^20 槽位的缓冲区合计从 16 MB 增至 32 MB，并且始终预先分配。
 - **复杂度。** 中等，`ring_buffer.h` 共 179 行，接口不变。
 - **行为变化。** 容量向上取整到 2 的幂；可用容量从 capacity-1 变为 capacity；`Size()` 包含已占用但尚未写完的槽位（[fix_details.md](fix_details.md) 第 3、5.1 节）。
-- **实测（队列基准）。** 8、32 线程、容量 2^20 时写入从未失败，读取方取出速率与写入速率一致（8 线程 2.82 到 4.00，32 线程 1.54 到 2.41）；所有运行中错序和丢失计数为 0。
+- **实测（队列基准）。** 8、32 线程、容量 2^20 时写入从未失败，读取方取出速率接近写入速率（取出：8 线程 2.82 到 4.00，32 线程 1.54 到 2.41）；所有运行中错序和丢失计数为 0。
 - **为什么采用。** 读取方不与写入方争锁；不需要第三方代码，接口不变，`data_dumper.cpp` 以外的调用方不需要修改。代价是内存翻倍。
 - **事后核对（见文首）。** 只测了两个有效变体：多线程下取出速率高于 mutex+deque（第 3.7 节）。
 
@@ -604,14 +604,14 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 
 ### 7.1 第一步：向使用方确认配置和崩溃时机，确认崩溃出在哪一处，补上 `b2e659d62f`
 
-准备：NPU 机器、CANN、面向 CPython 3.14t 编译的 torch；编译方法见 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的“Build and enable deliberately”一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的“Build and wheel identity”一节，GIL 版和 FT 版分别编译。使用方只有 wheel、没有对应源码时，用 `d3216c2` 的源码编译一份作为下文的“原构建”。
+准备：NPU 机器、CANN，与 CPython 3.14t ABI 匹配的 PyTorch 2.13.0（下面链接的文档没有说明 torch 本身的编译）。torch_npu 的编译方法见 [`../experimental_free_threaded/host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md) 的“Build and enable deliberately”一节和 [`../experimental_free_threaded/drain_r2.md`](../experimental_free_threaded/drain_r2.md) 的“Build and wheel identity”一节，GIL 版和 FT 版分别编译。下文的“原构建”指不含本分支修改、也不含 `b2e659d62f` 的构建：第 2 步优先用使用方实际使用的 wheel（它是否基于 `d3216c2` 没有核实）；第 3 步需要改源码，用 `d3216c2` 的源码编译。每一步都按 gdb `bt` 的栈顶或 ASan 报告的位置判断原因，不按是否崩溃判断；竞态按概率出现，多线程用例要重复运行。
 
 1. **向使用方要配置和崩溃时机。** profiler 配置（`with_stack`、`with_modules`、`activities` 是否含 CPU、`profile_memory`、`record_shapes`）、是否多线程，以及崩溃发生在开始采集、前向中，还是停止采集时。
-2. **在原构建上检查候选 1。** 原构建不含本分支的修改，也不含 `b2e659d62f`。用 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`，并在 gdb 下运行。第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。只看到前向崩溃不足以区分候选 1 和候选 3 中的问题 2（单个 Python 线程时仍有 C++ 写入线程）。候选 1 成立时，进程不会执行到停止采集，所以这一步看不到候选 2。
+2. **在原构建上检查候选 1。** 用 3.14t 运行单线程、`with_stack=True`、采集 CPU activity、含 `nn.Module` 前向的最小脚本，开启 `PYTHONFAULTHANDLER=1`，并在 gdb 下运行。第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。只看到前向崩溃不足以区分候选 1 和候选 3 中的问题 2（单个 Python 线程时仍有 C++ 写入线程）。候选 1 成立时，进程不会执行到停止采集，所以这一步看不到候选 2。
 3. **在原构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分，重新编译，然后：**
-   1. 重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。前向不再崩溃，即确认候选 1；停止采集时终止，对应候选 2。
-   2. 在同一构建上，按使用方的线程数运行多线程用例（有条件时用 ASan 构建）。这一构建仍含三处竞态，用来检查候选 3。
-4. **在本分支上补同一处修改（独立提交），编译本分支，运行第 3.2 步的同一个多线程用例，确认本分支的修复。** 本分支同样缺少 `b2e659d62f`，不补的话会先遇到候选 1。
+   1. 在 gdb 下重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。第 2 步在前向时崩溃、这里不再崩溃，即确认候选 1。如果停止采集时终止：栈顶往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者报 `_PyMem_DebugFree` 错误，对应候选 2；栈顶在 `DataDumper`、`RingBuffer` 中，对应候选 3 的问题 1。
+   2. 在同一构建上，用使用方的负载或等价的多线程脚本（按使用方的线程数）重复运行，有条件时用 ASan 构建。先关闭 `with_stack` 和 `with_modules` 运行一组：这时 `PythonTracer` 不启动，只剩候选 3 的问题 1、2；再按使用方的配置运行一组。按栈顶或 ASan 报告的位置判断归属。
+4. **在本分支上补同一处修改（独立提交），编译本分支，用第 3.2 步的同一组用例、同样的重复次数运行。** 只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认本分支的修复。另外覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置，确认能正常导出结果。本分支同样缺少 `b2e659d62f`，如果不补，会先遇到候选 1。
 
 第 4 步的修改做法：3.13 以下保留 `PyDict_GetItemString`，3.13 及以上用 `PyMapping_GetItemString`，并用 `THPObjectPtr` 持有返回的新引用（`PyDict_GetItemString` 返回借用引用，只替换函数名会造成引用泄漏）；取不到时判空跳过（上游 `ff5ad88d8a` 的做法是取不到时抛 `KeyError`，由回调的 `catch (...)` 处理）。**不要整个 cherry-pick `b2e659d62f`**：它还在 `~ThreadLocalResult` 里用 `#if ... PY_MINOR_VERSION < 12` 跳过 `Py_DECREF(ctx_)`（提交中的注释原文是 "purposefully allowing for a small leak"），这一部分不要移植，因为本分支的 `clear()` 已改为持有 GIL 释放 ctx；它也没有对取到的 `self` 判空。按第 4.2 节已验证的 C API 行为，3.13 及以上 `PyDict_GetItemString` 必定返回 NULL，所以本分支上的这处修改不取决于第 2、3 步的结果，作为一个独立提交。
 
