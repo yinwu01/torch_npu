@@ -259,7 +259,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 开始采集时记录已有调用栈 | FT：只记录当前线程。GIL：沿用 `PyThreadState_Swap` | FT 3.14 及以上：在 STW 期间枚举所有线程（306–318 行）。GIL：同样枚举 |
 | CPython 私有接口 | 不调用私有函数。直接读 `c_profilefunc`（第 518、592、628 行，上游和 `d3216c2` 也读）和 `c_profileobj`（第 560 行，只有本分支读）。字段在 `Include/cpython/pystate.h` 的 `struct _ts` 中（3.14.3 第 134、136 行），布局不属于稳定接口（已验证） | FT 3.14 及以上：`_PyEval_StopTheWorld`，自行 `extern "C"` 声明（60–62 行）。3.9–3.12：`_PyEval_SetProfile` |
 | GIL 构建的行为变化（推断） | 只有 `clear()` 改为获取 GIL | 不再有 `max_threads`（原默认 256）；`stop()` 清除其他工具的 profile 函数；每个事件多一次查表、`shared_ptr` 复制和 `try_lock` |
-| FT 热路径 | 每次调用至少两次 `data_mutex_`；`nn.Module` 帧多一次（第 851–859 行）；到阈值时在锁内上传 | 每个事件一次 `results_mutex_`，一次本线程 `callback_mutex_` 的 `try_lock`（拿不到就不记录）。上传时取 `report_mutex_` |
+| FT 热路径 | 每次调用至少两次 `data_mutex_`；`nn.Module` 帧多一次（第 851–859 行）；到阈值时在锁内上传 | 每个事件一次 `results_mutex_`，一次本线程 `callback_mutex_` 的 `try_lock`（获取失败时不记录）。上传时取 `report_mutex_` |
 | 3.13 及以上读 `self` | `PyDict_GetItemString`，返回 NULL | `PyMapping_GetItemString`，取不到时抛 `KeyError`，由 `catch (...)` 丢弃（640–681、752 行） |
 | ctx 释放时持有 GIL（#5658） | 是，`clear()` 获取 GIL | 是，`releaseContext()` 获取 GIL（424–430 行） |
 | 3.13t | 与 3.14t 同一套代码 | 只告警 `"The Python tracer is not thread-safe on Python 3.13t. Please use Python 3.14t or later."`，不做 STW |
@@ -496,7 +496,7 @@ flowchart TD
 | `PYTHONFAULTHANDLER=1` 或 `-X faulthandler` | SIGSEGV 时打印 Python 层调用栈，用来看崩溃在前向中还是停止采集时。GIL 构建打印所有线程。FT 构建只打印崩溃线程，并输出 `<Cannot show all threads while the GIL is disabled>`。 | 已验证（3.14.3、3.14.3t，输出经 `head -12` 截断） |
 | `PYTHONMALLOC=debug` | 未 attach 时调用 `PyObject_Free`，FT 构建以 `Fatal Python error: _PyMem_DebugFree: Python memory allocator called without an active thread state` 终止，GIL 构建提示 `called without holding the GIL`。不设时不报错。 | 已验证（同上） |
 | `PYTHONMALLOC=debug` 对候选 2 | 候选 2 经 `Py_DECREF` 释放，开启后在释放处终止，与 issue #5658 的描述一致。它对经 glibc malloc 分配的候选 3 无效，候选 3 用 ASan 构建。 | 推断 |
-| gdb `bt` | 取得 C++ 调用栈，读法见下表 | — |
+| gdb `bt` | 取得 C++ 调用栈，读法见下表 | 无 |
 
 | 栈顶位置 | 对应 |
 |---|---|
@@ -542,7 +542,7 @@ flowchart TD
 
 ## 附录：来自本机日志的数字
 
-下列数字的日志和脚本只在作者本机，没有上传，他人无法复现。仓库中只有 `test/cpp/profiler_thread_safety/`。表中路径相对于本机目录 `/SSD1/wuyin/project/torch_npu-work/`。
+下列数字的日志和脚本只在作者本机，没有上传，他人无法复现。仓库中只有 `test/cpp/profiler_thread_safety/`。
 
 | 数字 | 本机文件 |
 |---|---|

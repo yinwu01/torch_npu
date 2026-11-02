@@ -135,7 +135,7 @@ sequenceDiagram
     Note over W: 先 writers_.fetch_add 1，再读 start_，都用 seq_cst
     Note over S: 先 start_.exchange false，再读 writers_，都用 seq_cst
     Note over W,S: 两方的操作之间没有固定先后
-    alt 两种可能的全局顺序。其一：写入方读到 start_ 为 false
+    alt 至少一种情况成立。其一：写入方读到 start_ 为 false
         W->>W: 不访问缓冲区，fetch_sub 1
     else 其二：停止方读到 writers_ 大于 0
         S->>S: WaitWriters 忙等
@@ -373,7 +373,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调用 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。worker 如果在 profiler 启动前创建，profiler 不记录它的算子。worker 的数量和创建时机没有核实。影响是结果缺少这些算子数据，没有观察到崩溃。 |
-| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证，torch_npu 上的崩溃未验证。接手后按 [analysis.md](analysis.md) 第 7.1 节第 4 步补上，做法和背景见 [analysis.md](analysis.md) 第 7.1、4.2 节。 |
+| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证，torch_npu 上的崩溃未验证。接手后按 [analysis.md](analysis.md) 第 7.1 节第 4 步补上，背景见该文第 4.2 节。 |
 | `with_stack` 在 FT 构建下的锁争用 | 彻底解决要改为每个线程一份事件缓冲和缓存。上游 master 已是这种结构。上游每个事件仍获取一次全局 `results_mutex_`，次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.4、5.4 节。 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 有竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能在 `IsMstxDomainEnabled` 中读取。 |
 | `ProfilerMgr` 的其他非原子成员 | `Start/Stop/Init/Finalize` 写入 `path_`、`profConfig_` 等成员。多个线程同时调用这些控制函数时没有保护。 |
