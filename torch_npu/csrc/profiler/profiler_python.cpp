@@ -511,13 +511,21 @@ void PythonTracer::startOne()
     }
     GilAndRestoreThread gil;
     auto thread_state = gil.initial_thread_state();
-    // A second pass only runs after a stale install was removed, see below.
+    // A second pass only runs after a stale install was removed, see below. It retries
+    // once: if two full stop/start cycles pass during one startOne, this thread is
+    // left untraced for the newest session.
     for (int attempt = 0; attempt < 2; ++attempt) {
         if (!active_.load() || thread_state == nullptr || thread_state->c_profilefunc != nullptr) {
             return;
         }
         PyThreadState_Swap(thread_state);
         auto* ctx = newTraceContext();
+        // Drops our reference on every exit, including a Python error thrown
+        // from recordStartStack.
+        struct CtxRef {
+            PyObject* obj = nullptr;
+            ~CtxRef() { Py_XDECREF(obj); }
+        } own;
         uint64_t session = 0;
         bool registered = false;
         {
@@ -528,12 +536,13 @@ void PythonTracer::startOne()
                 // Take our own reference before the lock is released: from then on
                 // stop() and clear() can run on another thread and drop the list's one.
                 Py_XINCREF((PyObject*)ctx);
+                own.obj = (PyObject*)ctx;
                 session = session_;
                 registered = true;
             }
         }
         if (!registered) {
-            Py_XDECREF((PyObject*)ctx);
+            own.obj = (PyObject*)ctx;  // the creation reference, nobody else holds ctx
             return;
         }
         recordStartStack(ctx, session);
@@ -551,7 +560,6 @@ void PythonTracer::startOne()
         if (stale && thread_state->c_profileobj == (PyObject*)ctx) {
             PyEval_SetProfile(nullptr, nullptr);
         }
-        Py_XDECREF((PyObject*)ctx);
         if (!stale) {
             return;
         }

@@ -95,6 +95,9 @@ void DataDumper::WaitWriters()
 {
     // Pairs with Report(): writers_ is raised before start_ is read (both seq_cst), so after
     // start_ is false and writers_ reads 0, no Report call can still touch the buffer.
+    // Both sides must stay seq_cst (store then load); the stress test cannot detect a
+    // weaker ordering on x86 or under TSan. A child forked while a Report was in flight
+    // inherits writers_ > 0, so Stop must not be called in such a child.
     while (writers_.load() != 0) {
         std::this_thread::yield();
     }
