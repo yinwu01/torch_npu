@@ -1,5 +1,8 @@
 # Profiler upload path thread-safety stress test
 
+What was fixed, why, and what is still open: see
+[docs/experimental_free_threaded/profiler_thread_safety.md](../../../docs/experimental_free_threaded/profiler_thread_safety.md) (Chinese).
+
 Standalone tests for the profiler under concurrent use, as happens with free-threaded
 CPython (no GIL). Two binaries:
 
