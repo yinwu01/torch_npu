@@ -1,6 +1,7 @@
 #include <unistd.h>
 
 #include <vector>
+#include <thread>
 #include <map>
 #include <fstream>
 #include <sys/types.h>
@@ -22,17 +23,31 @@ DataDumper::~DataDumper()
 
 void DataDumper::Init(const std::string &path, size_t capacity = kDefaultRingBuffer)
 {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (start_.load()) {
+        ASCEND_LOGE("DataDumper is still running on %s, stop it and restart on %s.", path_.c_str(), path.c_str());
+    }
+    // Drain to the old path and close its files so the new path starts clean.
+    UnInitLocked();
     path_ = path;
+    create_dir_flag_ = true;
     data_chunk_buf_.Init(capacity);
     init_.store(true);
 }
 
 void DataDumper::UnInit()
 {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    UnInitLocked();
+}
+
+void DataDumper::UnInitLocked()
+{
+    // Never free the buffer while producers or the dump thread may still use it.
+    StopLocked();
     if (init_.load()) {
-        data_chunk_buf_.UnInit();
         init_.store(false);
-        start_.store(false);
+        data_chunk_buf_.UnInit();
         for (auto &f : fd_map_) {
             if (f.second != nullptr) {
                 fclose(f.second);
@@ -45,30 +60,57 @@ void DataDumper::UnInit()
 
 void DataDumper::Start()
 {
-    if (!init_.load() || Thread::Start() != 0) {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (!init_.load() || start_.load()) {
         return;
     }
+    // Set start_ before the thread exists so Run() does not see false and exit at once.
+    // control_mutex_ keeps Stop() from joining before pthread_create has set pid_.
     start_.store(true);
+    if (Thread::Start() != 0) {
+        start_.store(false);
+        WaitWriters();
+    }
 }
 
 void DataDumper::Stop()
 {
-    if (start_.load() == true) {
-        start_.store(false);
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    StopLocked();
+}
+
+void DataDumper::StopLocked()
+{
+    // Order: stop accepting data, wait for in-flight Report calls, join, then drain.
+    // The drain runs with control_mutex_ held and the dump thread joined (or never
+    // started), so it is the only consumer.
+    if (start_.exchange(false)) {
+        WaitWriters();
         Thread::Stop();
     }
     Flush();
 }
 
-void DataDumper::GatherAndDumpData()
+void DataDumper::WaitWriters()
+{
+    // Pairs with Report(): writers_ is raised before start_ is read (both seq_cst), so after
+    // start_ is false and writers_ reads 0, no Report call can still touch the buffer.
+    while (writers_.load() != 0) {
+        std::this_thread::yield();
+    }
+}
+
+size_t DataDumper::GatherAndDumpData()
 {
     std::map<std::string, std::vector<uint8_t>> dataMap;
     uint64_t batchSize = 0;
+    size_t count = 0;
     while (batchSize < kBatchMaxLen) {
         std::unique_ptr<BaseReportData> data = nullptr;
         if (!data_chunk_buf_.Pop(data) || data == nullptr) {
             break;
         }
+        count++;
         std::vector<uint8_t> encodeData = data->encode();
         batchSize += encodeData.size();
         const std::string &key = data->tag;
@@ -80,12 +122,12 @@ void DataDumper::GatherAndDumpData()
         }
     }
     if (dataMap.size() > 0) {
-        static bool create_flag = true;
-        if (create_flag) {
-            create_flag = !Utils::CreateDir(this->path_);
+        if (create_dir_flag_) {
+            create_dir_flag_ = !Utils::CreateDir(this->path_);
         }
         Dump(dataMap);
     }
+    return count;
 }
 
 void DataDumper::Run()
@@ -94,9 +136,9 @@ void DataDumper::Run()
         if (!start_.load()) {
             break;
         }
-        if (data_chunk_buf_.Size() > kNotifyInterval) {
-            GatherAndDumpData();
-        } else {
+        // Size() also counts claimed slots that are not published yet, so sleep when
+        // nothing could be popped instead of spinning on Size().
+        if (data_chunk_buf_.Size() <= kNotifyInterval || GatherAndDumpData() == 0) {
             usleep(kMaxWaitTimeUs);
         }
     }
@@ -104,17 +146,23 @@ void DataDumper::Run()
 
 void DataDumper::Flush()
 {
-    while (data_chunk_buf_.Size() != 0) {
-        GatherAndDumpData();
+    // Loop on Pop results, not Size(), so a half-written slot can never make this spin.
+    while (GatherAndDumpData() > 0) {
     }
 }
 
 void DataDumper::Report(std::unique_ptr<BaseReportData> data)
 {
-    if (C10_UNLIKELY(!start_.load() || data == nullptr)) {
+    // Cheap early exit when not running; the real check is the one after fetch_add.
+    if (C10_UNLIKELY(data == nullptr || !start_.load(std::memory_order_relaxed))) {
         return;
     }
-    data_chunk_buf_.Push(std::move(data));
+    // Register as a writer before checking start_ again; see WaitWriters().
+    writers_.fetch_add(1);
+    if (C10_LIKELY(start_.load())) {
+        data_chunk_buf_.Push(std::move(data));
+    }
+    writers_.fetch_sub(1, std::memory_order_release);
 }
 
 void DataDumper::Dump(const std::map<std::string, std::vector<uint8_t>> &dataMap)
@@ -150,17 +198,31 @@ TraceDataDumper::~TraceDataDumper()
 
 void TraceDataDumper::Init(const std::string &path, size_t capacity)
 {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (start_.load()) {
+        ASCEND_LOGE("TraceDataDumper is still running on %s, stop it and restart on %s.", path_.c_str(), path.c_str());
+    }
+    // Drain to the old path and close its files so the new path starts clean.
+    UnInitLocked();
     path_ = path;
+    create_dir_flag_ = true;
     trace_data_buf_.Init(capacity);
     init_.store(true);
 }
 
 void TraceDataDumper::UnInit()
 {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    UnInitLocked();
+}
+
+void TraceDataDumper::UnInitLocked()
+{
+    // Never free the buffer while producers or the dump thread may still use it.
+    StopLocked();
     if (init_.load()) {
-        trace_data_buf_.UnInit();
         init_.store(false);
-        start_.store(false);
+        trace_data_buf_.UnInit();
         for (auto &f : fd_map_) {
             if (f.second != nullptr) {
                 fclose(f.second);
@@ -173,23 +235,46 @@ void TraceDataDumper::UnInit()
 
 void TraceDataDumper::Start()
 {
-    if (!init_.load() || Thread::Start() != 0) {
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    if (!init_.load() || start_.load()) {
         return;
     }
+    // Set start_ before the thread exists so Run() does not see false and exit at once.
+    // control_mutex_ keeps Stop() from joining before pthread_create has set pid_.
     start_.store(true);
+    if (Thread::Start() != 0) {
+        start_.store(false);
+        WaitWriters();
+    }
 }
 
 void TraceDataDumper::Stop()
 {
-    if (start_.load() == true) {
-        start_.store(false);
+    std::lock_guard<std::mutex> lock(control_mutex_);
+    StopLocked();
+}
+
+void TraceDataDumper::StopLocked()
+{
+    // Order: stop accepting data, wait for in-flight Report calls, join, then drain.
+    // The drain runs with control_mutex_ held and the dump thread joined (or never
+    // started), so it is the only consumer.
+    if (start_.exchange(false)) {
+        WaitWriters();
         Thread::Stop();
     }
-    while (trace_data_buf_.Size() != 0) {
-        FlushTraceData();
+    while (FlushTraceData()) {
     }
     FlushHashData();
     FlushParamData();
+}
+
+void TraceDataDumper::WaitWriters()
+{
+    // Same protocol as DataDumper::WaitWriters().
+    while (writers_.load() != 0) {
+        std::this_thread::yield();
+    }
 }
 
 void TraceDataDumper::Run()
@@ -198,9 +283,8 @@ void TraceDataDumper::Run()
         if (!start_.load()) {
             break;
         }
-        if (trace_data_buf_.Size() > 0) {
-            FlushTraceData();
-        } else {
+        // Drive by Pop results: a claimed but unpublished slot must not cause a spin.
+        if (!FlushTraceData()) {
             usleep(kMaxWaitTimeUs);
         }
     }
@@ -208,40 +292,74 @@ void TraceDataDumper::Run()
 
 void TraceDataDumper::Report(std::unique_ptr<PythonTracerFuncData> data)
 {
-    if (C10_UNLIKELY(!start_.load() || data == nullptr)) {
+    // Cheap early exit when not running; the real check is the one after fetch_add.
+    if (C10_UNLIKELY(data == nullptr || !start_.load(std::memory_order_relaxed))) {
         return;
     }
-    trace_data_buf_.Push(std::move(data));
+    writers_.fetch_add(1);
+    if (C10_LIKELY(start_.load())) {
+        trace_data_buf_.Push(std::move(data));
+    }
+    writers_.fetch_sub(1, std::memory_order_release);
 }
 
 void TraceDataDumper::ReportHash(std::unique_ptr<PythonTracerHashData> data)
 {
-    if (C10_UNLIKELY(!start_.load() || data == nullptr)) {
+    // Cheap early exit when not running; the real check is the one after fetch_add.
+    if (C10_UNLIKELY(data == nullptr || !start_.load(std::memory_order_relaxed))) {
         return;
     }
-    trace_hash_data_ = std::move(data);
+    writers_.fetch_add(1);
+    if (C10_LIKELY(start_.load())) {
+        std::lock_guard<std::mutex> lock(extra_data_mutex_);
+        trace_hash_data_ = std::move(data);
+    }
+    writers_.fetch_sub(1, std::memory_order_release);
 }
 
 void TraceDataDumper::ReportParam(std::unique_ptr<ParamTensorData> data)
 {
-    if (C10_UNLIKELY(!start_.load() || data == nullptr)) {
+    // Cheap early exit when not running; the real check is the one after fetch_add.
+    if (C10_UNLIKELY(data == nullptr || !start_.load(std::memory_order_relaxed))) {
         return;
     }
-    param_data_ = std::move(data);
+    writers_.fetch_add(1);
+    if (C10_LIKELY(start_.load())) {
+        std::lock_guard<std::mutex> lock(extra_data_mutex_);
+        param_data_ = std::move(data);
+    }
+    writers_.fetch_sub(1, std::memory_order_release);
 }
 
 void TraceDataDumper::CreateDumpDir()
 {
-    static bool create_flag = true;
-    if (create_flag) {
-        create_flag = !Utils::CreateDir(this->path_);
+    if (create_dir_flag_) {
+        create_dir_flag_ = !Utils::CreateDir(this->path_);
     }
 }
 
-void TraceDataDumper::FlushTraceData()
+bool TraceDataDumper::FlushTraceData()
 {
     std::unique_ptr<PythonTracerFuncData> data = nullptr;
     if (!trace_data_buf_.Pop(data) || data == nullptr) {
+        return false;
+    }
+    auto encode_data = data->encode();
+    if (!encode_data.empty()) {
+        CreateDumpDir();
+        Dump(data->tag, encode_data);
+    }
+    return true;
+}
+
+void TraceDataDumper::FlushHashData()
+{
+    std::unique_ptr<PythonTracerHashData> data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(extra_data_mutex_);
+        data = std::move(trace_hash_data_);
+    }
+    if (data == nullptr) {
         return;
     }
     auto encode_data = data->encode();
@@ -251,30 +369,21 @@ void TraceDataDumper::FlushTraceData()
     }
 }
 
-void TraceDataDumper::FlushHashData()
-{
-    if (trace_hash_data_ == nullptr) {
-        return;
-    }
-    auto encode_data = trace_hash_data_->encode();
-    if (!encode_data.empty()) {
-        CreateDumpDir();
-        Dump(trace_hash_data_->tag, encode_data);
-    }
-    trace_hash_data_ = nullptr;
-}
-
 void TraceDataDumper::FlushParamData()
 {
-    if (param_data_ == nullptr) {
+    std::unique_ptr<ParamTensorData> data = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(extra_data_mutex_);
+        data = std::move(param_data_);
+    }
+    if (data == nullptr) {
         return;
     }
-    auto encode_data = param_data_->encode();
+    auto encode_data = data->encode();
     if (!encode_data.empty()) {
         CreateDumpDir();
-        Dump(param_data_->tag, encode_data);
+        Dump(data->tag, encode_data);
     }
-    param_data_ = nullptr;
 }
 
 void TraceDataDumper::Dump(const std::string &file_name, const std::vector<uint8_t> &encode_data)

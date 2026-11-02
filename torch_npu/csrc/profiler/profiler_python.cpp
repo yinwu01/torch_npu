@@ -1,8 +1,10 @@
 #include "torch_npu/csrc/profiler/containers.h"
 #include "torch_npu/csrc/profiler/profiler_python.h"
 
+#include <atomic>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <utility>
 
@@ -72,10 +74,73 @@ private:
     PyThreadState* initial_thread_state_{nullptr};
 };
 
-struct ThreadLocalResult;
+#ifdef Py_GIL_DISABLED
+// Without the GIL the tracer state is shared by all traced threads at once.
+// PyMutex detaches the waiting thread state, so a thread blocked here never
+// holds up a stop-the-world pause or another thread's attach. A std::mutex
+// would deadlock in both cases.
+class TracerMutex {
+public:
+    void lock()
+    {
+        PyMutex_Lock(&mutex_);
+    }
+    void unlock()
+    {
+        PyMutex_Unlock(&mutex_);
+    }
+
+private:
+    PyMutex mutex_{};
+};
+
+// For start()/stop()/clear(), which run Python code while holding it. If that
+// code re-enters one of them on the same thread, fail instead of deadlocking
+// (PyMutex is not recursive).
+class TracerControlMutex {
+public:
+    void lock()
+    {
+        unsigned long self = PyThread_get_thread_ident();
+        TORCH_CHECK(owner_.load(std::memory_order_relaxed) != self,
+            "PythonTracer start/stop/clear re-entered on the same thread.", PROF_ERROR(ErrCode::INTERNAL));
+        PyMutex_Lock(&mutex_);
+        owner_.store(self, std::memory_order_relaxed);
+    }
+    void unlock()
+    {
+        owner_.store(0, std::memory_order_relaxed);
+        PyMutex_Unlock(&mutex_);
+    }
+
+private:
+    PyMutex mutex_{};
+    std::atomic<unsigned long> owner_{0};
+};
+#else
+// With the GIL all callers are already serialized; keep the old behaviour.
+class TracerMutex {
+public:
+    void lock() {}
+    void unlock() {}
+};
+using TracerControlMutex = TracerMutex;
+#endif
+using TracerLockGuard = std::lock_guard<TracerMutex>;
+using TracerControlGuard = std::lock_guard<TracerControlMutex>;
+
+class PythonTracer;
 struct TraceContext {
     PyObject_HEAD
-    ThreadLocalResult* thread_local_result_;
+    // Read lock-free by pyProfileFn on any traced thread. The hook only touches
+    // ctx and the tracer singleton, never the ThreadLocalResult, which clear()
+    // can free at any time. ctx is kept alive by the thread state's reference
+    // only while this thread stays attached: without the GIL, read it before
+    // the first tracer lock wait (which detaches) and not after.
+    std::atomic<PythonTracer*> tracer_;
+    // Set before publishing for the ctx that start() installs on all threads
+    // (free-threaded build only); see ctxKey().
+    bool shared_;
 };
 
 static PyTypeObject TraceContextType = {
@@ -120,14 +185,21 @@ static PyTypeObject TraceContextType = {
     nullptr                     /* tp_free */
 };
 
-class PythonTracer;
+static TraceContext* newTraceContext()
+{
+    return (TraceContext*) TraceContextType.tp_alloc(&TraceContextType, 0);
+}
+
 struct ThreadLocalResult {
-    explicit ThreadLocalResult(PythonTracer* active_tracer)
+    // Takes over the reference to ctx (from newTraceContext(), may be null).
+    // ctx is allocated by the caller so that no Python allocation happens
+    // while registration_mutex_ is held.
+    ThreadLocalResult(PythonTracer* active_tracer, TraceContext* ctx)
         : active_tracer_(active_tracer),
-          ctx_((TraceContext*) TraceContextType.tp_alloc(&TraceContextType, 0))
+          ctx_(ctx)
     {
         if (ctx_) {
-            ctx_->thread_local_result_ = this;
+            ctx_->tracer_.store(active_tracer, std::memory_order_release);
         }
     }
 
@@ -140,6 +212,8 @@ struct ThreadLocalResult {
     ~ThreadLocalResult()
     {
         if (ctx_) {
+            // Turns a hook that still holds ctx_ into a no-op.
+            ctx_->tracer_.store(nullptr, std::memory_order_release);
             Py_DECREF((PyObject*)ctx_);
         }
         active_tracer_ = nullptr;
@@ -228,14 +302,30 @@ private:
     void recordCCall(TraceContext* ctx, PyFrameObject* frame, PyObject* arg);
     void recordReturn(TraceContext* ctx, PyFrameObject* frame, TraceTag tag);
     void recordEvent(TraceTag tag, size_t hash_key);
+    void recordStartStack(TraceContext* ctx, uint64_t session);
     void reportTraceData();
     void reportHashData();
     void reportParamData();
     std::string trimPrefix(std::string s);
 
 private:
+    // Lock order: control_mutex_ -> registration_mutex_ -> data_mutex_ ->
+    // ProfilerMgr upload (leaf, never calls back).
+    // control_mutex_ serialises start()/stop()/clear() and is held while they
+    // run Python; re-entering one of them on the same thread throws.
+    // registration_mutex_ and data_mutex_ are only held around container
+    // updates, never across Python calls or allocations, so a finalizer or
+    // __getattr__ that calls startOne()/stopOne() cannot self-deadlock.
+    // Waiting on any of them detaches the thread state (see TracerMutex).
+    // All are no-ops with the GIL.
+    TracerControlMutex control_mutex_;  // start()/stop()/clear(), interpreter_
+    TracerMutex registration_mutex_;    // thread_local_results_, start_py_call_info_, session_
+    TracerMutex data_mutex_;            // caches, events_, ctx_tid_map_
     std::atomic<bool> active_{false};
-    bool record_params_{false};
+    std::atomic<bool> record_params_{false};
+    // Bumped by stop() before it removes the hooks. A startOne() whose session
+    // changed while it ran removes the hook it installed itself.
+    uint64_t session_{0};
     PyInterpreterState* interpreter_{nullptr};
     std::deque<ThreadLocalResult> thread_local_results_;
     PyObject* module_call_code_{nullptr};
@@ -288,9 +378,53 @@ PythonTracer::PythonTracer() : active_(false)
         .cast<std::vector<std::string>>();
 }
 
+// Key for the per-thread maps (start_py_call_info_, ctx_tid_map_). A ctx
+// registered for one thread is keyed by its address, which cannot be reused
+// within a session (thread_local_results_ holds it until clear()). The shared
+// ctx that start() installs on all threads without the GIL is keyed by thread id.
+static uintptr_t ctxKey(TraceContext* ctx)
+{
+    if (ctx != nullptr && ctx->shared_) {
+        return static_cast<uintptr_t>(torch_npu::toolkit::profiler::Utils::GetTid());
+    }
+    return reinterpret_cast<uintptr_t>(ctx);
+}
+
+// Record the frames that were already on the current thread's stack before
+// profiling started. Must not be called with registration_mutex_ held: the
+// frame walk runs Python code. Dropped if the session that registered ctx has
+// been stopped meanwhile.
+void PythonTracer::recordStartStack(TraceContext* ctx, uint64_t session)
+{
+    std::vector<THPFrameObjectPtr> current_stack;
+    auto frame = PyEval_GetFrame_NPU();
+    size_t depth = 0;  // Make sure we can't infinite loop.
+    while (frame != nullptr && depth <= STACK_MAX_DEPTH) {
+        current_stack.emplace_back(frame);
+        frame = PyFrame_GetBack(frame);
+        ++depth;
+    }
+    // record py call before profiler start
+    std::vector<StartPyCall> calls;
+    calls.reserve(current_stack.size());
+    for (auto it = current_stack.rbegin(); it != current_stack.rend(); it++) {
+        calls.emplace_back(genPyCallHashId(*it));
+    }
+    TracerLockGuard reg_guard(registration_mutex_);
+    if (!active_.load() || session_ != session) {
+        return;
+    }
+    auto& start_calls = start_py_call_info_[ctxKey(ctx)];
+    start_calls.insert(start_calls.end(), calls.begin(), calls.end());
+}
+
 void PythonTracer::start(size_t max_threads)
 {
-    TORCH_CHECK(thread_local_results_.empty(), "PythonTracer should not have active contexts", PROF_ERROR(ErrCode::INTERNAL));
+    TracerControlGuard control_guard(control_mutex_);
+    {
+        TracerLockGuard reg_guard(registration_mutex_);
+        TORCH_CHECK(thread_local_results_.empty(), "PythonTracer should not have active contexts", PROF_ERROR(ErrCode::INTERNAL));
+    }
     TORCH_CHECK(max_threads > 0, "max_threads must be positive, got ", max_threads, PROF_ERROR(ErrCode::VALUE));
     TORCH_CHECK(max_threads <= max_py_threads, "max_threads must be less equal to ", max_py_threads, PROF_ERROR(ErrCode::VALUE));
 
@@ -301,6 +435,18 @@ void PythonTracer::start(size_t max_threads)
         return;
     }
 
+    auto config = torch::autograd::profiler::getProfilerConfig();
+    const bool record_params = config.report_input_shapes
+        && (config.with_stack || config.with_modules)
+        && config.profile_memory;
+#ifdef Py_GIL_DISABLED
+    // Set before any hook is installed: other threads run the hook as soon as
+    // it is installed, and a module or optimizer first seen with the flag off
+    // never has its params parsed later. Stored every start, so a session
+    // without param recording does not inherit the flag from an earlier one.
+    record_params_.store(record_params, std::memory_order_release);
+#endif
+
     GilAndRestoreThread gil;
     interpreter_ = PyInterpreterState_Get();
     if (!gil.initial_thread_state()) {
@@ -308,6 +454,25 @@ void PythonTracer::start(size_t max_threads)
         return;
     }
 
+#ifdef Py_GIL_DISABLED
+    // Other threads keep running, so their thread states cannot be swapped in
+    // (attach would spin until they detach) and their stacks cannot be walked.
+    // Record only this thread's stack and let CPython install the hook on all
+    // threads under a stop-the-world pause. max_threads is not applied here.
+    // ctx stays valid below: clear() cannot run while control_mutex_ is held.
+    auto* ctx = newTraceContext();
+    if (ctx) {
+        ctx->shared_ = true;
+    }
+    uint64_t session = 0;
+    {
+        TracerLockGuard reg_guard(registration_mutex_);
+        thread_local_results_.emplace_back(this, ctx);
+        session = session_;
+    }
+    recordStartStack(ctx, session);
+    PyEval_SetProfileAllThreads(PythonTracer::pyProfileFn, (PyObject*)ctx);
+#else
     std::vector<PyThreadState*> thread_states = getInterpreterThreads(interpreter_);
     if (thread_states.empty()) {
         ASCEND_LOGW("There is no active thread, PythonTracer will not start.")
@@ -321,30 +486,22 @@ void PythonTracer::start(size_t max_threads)
     // Register the tracer in each thread.
     for (const auto thread_state : thread_states) {
         PyThreadState_Swap(thread_state);
-        thread_local_results_.emplace_back(this);
-        auto* ctx = thread_local_results_.back().ctx_;
-
-        std::vector<THPFrameObjectPtr> current_stack;
-        auto frame = PyEval_GetFrame_NPU();
-        size_t depth = 0;  // Make sure we can't infinite loop.
-        while (frame != nullptr && depth <= STACK_MAX_DEPTH) {
-            current_stack.emplace_back(frame);
-            frame = PyFrame_GetBack(frame);
-            ++depth;
+        auto* ctx = newTraceContext();
+        uint64_t session = 0;
+        {
+            TracerLockGuard reg_guard(registration_mutex_);
+            thread_local_results_.emplace_back(this, ctx);
+            session = session_;
         }
-        // record py call before profiler start
-        for (auto it = current_stack.rbegin(); it != current_stack.rend(); it++) {
-            start_py_call_info_[reinterpret_cast<uintptr_t>(ctx)].emplace_back(genPyCallHashId(*it));
-        }
+        recordStartStack(ctx, session);
         PyEval_SetProfile(PythonTracer::pyProfileFn, (PyObject*)ctx);
     }
 
-    auto config = torch::autograd::profiler::getProfilerConfig();
-    if (config.report_input_shapes
-        && (config.with_stack || config.with_modules)
-        && config.profile_memory) {
+    // With the GIL keep the original order and sticky behaviour.
+    if (record_params) {
         record_params_ = true;
     }
+#endif
 }
 
 void PythonTracer::startOne()
@@ -354,38 +511,87 @@ void PythonTracer::startOne()
     }
     GilAndRestoreThread gil;
     auto thread_state = gil.initial_thread_state();
-    if (thread_state && thread_state->c_profilefunc == nullptr) {
+    // A second pass only runs after a stale install was removed, see below.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!active_.load() || thread_state == nullptr || thread_state->c_profilefunc != nullptr) {
+            return;
+        }
         PyThreadState_Swap(thread_state);
-        thread_local_results_.emplace_back(this);
-        auto* ctx = thread_local_results_.back().ctx_;
-
-        std::vector<THPFrameObjectPtr> current_stack;
-        auto frame = PyEval_GetFrame_NPU();
-        size_t depth = 0;  // Make sure we can't infinite loop.
-        while (frame != nullptr && depth <= STACK_MAX_DEPTH) {
-            current_stack.emplace_back(frame);
-            frame = PyFrame_GetBack(frame);
-            ++depth;
+        auto* ctx = newTraceContext();
+        uint64_t session = 0;
+        bool registered = false;
+        {
+            TracerLockGuard reg_guard(registration_mutex_);
+            // stop() may have run since the check above.
+            if (active_.load()) {
+                thread_local_results_.emplace_back(this, ctx);
+                // Take our own reference before the lock is released: from then on
+                // stop() and clear() can run on another thread and drop the list's one.
+                Py_XINCREF((PyObject*)ctx);
+                session = session_;
+                registered = true;
+            }
         }
-        // record py call before profiler start
-        for (auto it = current_stack.rbegin(); it != current_stack.rend(); it++) {
-            start_py_call_info_[reinterpret_cast<uintptr_t>(ctx)].emplace_back(genPyCallHashId(*it));
+        if (!registered) {
+            Py_XDECREF((PyObject*)ctx);
+            return;
         }
+        recordStartStack(ctx, session);
         PyEval_SetProfile(PythonTracer::pyProfileFn, (PyObject*)ctx);
+        bool stale = false;
+        {
+            TracerLockGuard reg_guard(registration_mutex_);
+            stale = session_ != session;
+        }
+        // stop() bumps session_ before it removes the hooks, so if it did not
+        // change, stop() has not removed hooks yet and will remove ours too.
+        // Otherwise our hook may have been installed after that removal: take it
+        // off again. If a new session started meanwhile, our install replaced its
+        // hook on this thread, so the next pass registers for the new session.
+        if (stale && thread_state->c_profileobj == (PyObject*)ctx) {
+            PyEval_SetProfile(nullptr, nullptr);
+        }
+        Py_XDECREF((PyObject*)ctx);
+        if (!stale) {
+            return;
+        }
     }
 }
 
 void PythonTracer::stop()
 {
+    TracerControlGuard control_guard(control_mutex_);
     TORCH_INTERNAL_ASSERT(active_.load(), "PythonTracer is not running.", PROF_ERROR(ErrCode::INTERNAL));
 
     GilAndRestoreThread gil;
+    {
+        // Both before the hooks are removed, in one step, so that a startOne()
+        // either registered in this session and sees session_ change, or sees
+        // active_ false and registers nothing; see startOne(). Hooks that still run
+        // drop their events from here on. With the GIL, holding it orders this.
+        TracerLockGuard reg_guard(registration_mutex_);
+        active_ = false;
+        ++session_;
+    }
+#ifdef Py_GIL_DISABLED
+    // Another running thread's profile function cannot be read safely, so this
+    // clears it on every thread, including one set by a different profiler.
+    // CPython does it under a stop-the-world pause: once this returns no thread
+    // can enter pyProfileFn with our ctx any more.
+    PyEval_SetProfileAllThreads(nullptr, nullptr);
+#else
     for (const auto thread_state : getInterpreterThreads(interpreter_)) {
         if (thread_state->c_profilefunc == &PythonTracer::pyProfileFn) {
             PyThreadState_Swap(thread_state);
             PyEval_SetProfile(nullptr, nullptr);
         }
     }
+#endif
+    // A hook that was already running may still be inside a record call; it
+    // re-checks active_ under data_mutex_ and drops its event. No Python code
+    // runs below.
+    TracerLockGuard reg_guard(registration_mutex_);
+    TracerLockGuard data_guard(data_mutex_);
     for (const auto& start_py_call : start_py_call_info_) {
         auto ctx_tid = ctx_tid_map_.find(start_py_call.first);
         if (ctx_tid != ctx_tid_map_.end()) {
@@ -398,7 +604,6 @@ void PythonTracer::stop()
             }
         }
     }
-    active_ = false;
     reportTraceData();
     reportHashData();
     reportParamData();
@@ -406,6 +611,7 @@ void PythonTracer::stop()
 
 void PythonTracer::stopOne()
 {
+    // Touches only this thread's own state, so no tracer lock is needed.
     if (!active_.load()) {
         return;
     }
@@ -419,17 +625,34 @@ void PythonTracer::stopOne()
 
 void PythonTracer::clear()
 {
-    TORCH_CHECK(!active_.load(), "Cannot clear state while PythonTracer is active.", PROF_ERROR(ErrCode::INTERNAL));
-    py_call_cache_.clear();
-    pyc_call_cache_.clear();
-    module_info_cache_.clear();
-    module_param_cache_.clear();
-    optimizer_param_cache_.clear();
-    events_.clear();
-    ctx_tid_map_.clear();
-    start_py_call_info_.clear();
-    thread_local_results_.clear();
-    interpreter_ = nullptr;
+    std::deque<ThreadLocalResult> results;
+    {
+        TracerControlGuard control_guard(control_mutex_);
+        {
+            TracerLockGuard reg_guard(registration_mutex_);
+            TORCH_CHECK(!active_.load(), "Cannot clear state while PythonTracer is active.", PROF_ERROR(ErrCode::INTERNAL));
+            results.swap(thread_local_results_);
+            start_py_call_info_.clear();
+        }
+        {
+            TracerLockGuard data_guard(data_mutex_);
+            py_call_cache_.clear();
+            pyc_call_cache_.clear();
+            module_info_cache_.clear();
+            module_param_cache_.clear();
+            optimizer_param_cache_.clear();
+            events_.clear();
+            ctx_tid_map_.clear();
+        }
+        interpreter_ = nullptr;
+    }
+    if (!results.empty()) {
+        // ~ThreadLocalResult drops a Python reference, which can run finalizers;
+        // do it with no tracer lock held. The caller (stopNpuProfiler) has
+        // released the GIL, so take it back here.
+        pybind11::gil_scoped_acquire gil;
+        results.clear();
+    }
 }
 
 std::string PythonTracer::trimPrefix(std::string s)
@@ -443,6 +666,8 @@ std::string PythonTracer::trimPrefix(std::string s)
     return s;
 }
 
+// reportTraceData/reportHashData/reportParamData and recordEvent: caller holds
+// data_mutex_. Uploading under it keeps batches in order and none after stop().
 void PythonTracer::reportTraceData()
 {
     if (events_.size() > 0) {
@@ -584,17 +809,33 @@ size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
 {
     TORCH_INTERNAL_ASSERT(frame != nullptr, "frame can not be nullptr.", PTA_ERROR(ErrCode::PARAM));
 
+    // Python calls run outside data_mutex_: they can run arbitrary code.
     auto call_info = PyCallInfo(frame);
     auto hash_id = call_info.get_hash_id();
     auto f_code = PyFrame_GetCode_NPU(frame);
-    if (py_call_cache_.find(hash_id) == py_call_cache_.end()) {
-        py_call_cache_.insert({hash_id, call_info});
+    bool new_call = false;
+    {
+        TracerLockGuard data_guard(data_mutex_);
+        if (active_.load(std::memory_order_relaxed) && py_call_cache_.find(hash_id) == py_call_cache_.end()) {
+            py_call_cache_.insert({hash_id, call_info});
+            new_call = true;
+        }
+    }
 
-        // check optim.Optimizer call
-        if (record_params_ && ((PyObject*)f_code.get() == optimizer_call_code_)) {
-            auto f_locals = PyFrame_GetLocals_NPU(frame);
-            auto optimizer_class = PyDict_GetItemString(f_locals, "self");
-            parseOptimizerParams(optimizer_param_cache_, (PyObject*)optimizer_class, hash_id);
+    // check optim.Optimizer call
+    if (new_call && record_params_.load(std::memory_order_relaxed)
+        && ((PyObject*)f_code.get() == optimizer_call_code_)) {
+        auto f_locals = PyFrame_GetLocals_NPU(frame);
+        auto optimizer_class = PyDict_GetItemString(f_locals, "self");
+        std::vector<std::pair<size_t, std::vector<OptimizerParam>>> optimizer_params;
+        parseOptimizerParams(optimizer_params, (PyObject*)optimizer_class, hash_id);
+        if (!optimizer_params.empty()) {
+            TracerLockGuard data_guard(data_mutex_);
+            if (active_.load(std::memory_order_relaxed)) {
+                for (auto& item : optimizer_params) {
+                    optimizer_param_cache_.emplace_back(std::move(item));
+                }
+            }
         }
     }
 
@@ -603,11 +844,31 @@ size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
         auto f_locals = PyFrame_GetLocals_NPU(frame);
         auto module_class = PyDict_GetItemString(f_locals, "self");
         hash_id = c10::get_hash(module_class);
-        if (module_info_cache_.find(hash_id) == module_info_cache_.end()) {
-            module_info_cache_.insert({hash_id, ModuleInfo(module_class)});
-
-            if (record_params_) {
-                parseModuleParams(module_param_cache_, (PyObject*)module_class, hash_id);
+        bool known = false;
+        {
+            TracerLockGuard data_guard(data_mutex_);
+            known = module_info_cache_.find(hash_id) != module_info_cache_.end();
+        }
+        if (!known) {
+            ModuleInfo module_info(module_class);
+            bool inserted = false;
+            {
+                TracerLockGuard data_guard(data_mutex_);
+                if (active_.load(std::memory_order_relaxed)) {
+                    inserted = module_info_cache_.insert({hash_id, module_info}).second;
+                }
+            }
+            if (inserted && record_params_.load(std::memory_order_relaxed)) {
+                std::vector<std::pair<size_t, std::vector<ModuleParam>>> module_params;
+                parseModuleParams(module_params, (PyObject*)module_class, hash_id);
+                if (!module_params.empty()) {
+                    TracerLockGuard data_guard(data_mutex_);
+                    if (active_.load(std::memory_order_relaxed)) {
+                        for (auto& item : module_params) {
+                            module_param_cache_.emplace_back(std::move(item));
+                        }
+                    }
+                }
             }
         }
     }
@@ -617,6 +878,10 @@ size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
 void PythonTracer::recordPyCall(TraceContext* ctx, PyFrameObject* frame)
 {
     auto hash_id = genPyCallHashId(frame);
+    TracerLockGuard data_guard(data_mutex_);
+    if (!active_.load(std::memory_order_relaxed)) {
+        return;
+    }
     recordEvent(TraceTag::kPy_Call, hash_id);
 }
 
@@ -624,6 +889,10 @@ void PythonTracer::recordCCall(TraceContext* ctx, PyFrameObject* frame, PyObject
 {
     std::string call_info = py::repr(arg);
     auto hash_id = c10::get_hash(call_info);
+    TracerLockGuard data_guard(data_mutex_);
+    if (!active_.load(std::memory_order_relaxed)) {
+        return;
+    }
     if (pyc_call_cache_.find(hash_id) == pyc_call_cache_.end()) {
         pyc_call_cache_.insert({hash_id, at::StringView(std::move(call_info))});
     }
@@ -632,10 +901,16 @@ void PythonTracer::recordCCall(TraceContext* ctx, PyFrameObject* frame, PyObject
 
 void PythonTracer::recordReturn(TraceContext* ctx, PyFrameObject* frame, TraceTag tag)
 {
+    // Read ctx before taking the lock: waiting on it detaches this thread, and
+    // stop() and clear() can then remove the hook and free ctx.
+    auto ctx_addr = ctxKey(ctx);
+    TracerLockGuard data_guard(data_mutex_);
+    if (!active_.load(std::memory_order_relaxed)) {
+        return;
+    }
     recordEvent(tag, EXIT_EVENT_HASH_ID);
 
     // record ctx to thread id map
-    auto ctx_addr = reinterpret_cast<uintptr_t>(ctx);
     if (ctx_tid_map_.find(ctx_addr) == ctx_tid_map_.end()) {
         ctx_tid_map_.insert({ctx_addr, torch_npu::toolkit::profiler::Utils::GetTid()});
     }
@@ -651,10 +926,7 @@ int PythonTracer::pyProfileFn(
     if (ctx == nullptr) {
         return 0;
     }
-    if (ctx->thread_local_result_ == nullptr) {
-        return 0;
-    }
-    auto active_tracer = ctx->thread_local_result_->active_tracer_;
+    auto active_tracer = ctx->tracer_.load(std::memory_order_acquire);
     if (active_tracer == nullptr || !active_tracer->active_.load(std::memory_order_relaxed)) {
         return 0;
     }
