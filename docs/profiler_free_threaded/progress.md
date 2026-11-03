@@ -83,5 +83,6 @@
 ## 交付状态
 
 - 代码修改只在 stub 环境中验证过。没有用真实 torch、CPython 3.14t、CANN 头文件编译，没有在 NPU 上运行。
-- 使用方崩溃的根因没有确定，三个候选见 [README.md](README.md)。
+- 11-03 NPU 结果：`npu_check.py --stack` 单线程 SIGSEGV（退出码 139），栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`，确认候选 1。不开 `with_stack` 的单线程和 4 线程 20 次都正常退出。4 线程开 `with_stack` 跑到第 13 或 14 次时磁盘满，没有崩溃。
+- 候选 1 的修改在 `1ece90d`，未在 NPU 上重测。候选 2、3 是否也会导致崩溃，结论待定。
 - 审阅：代码三轮，每轮两位审阅者；原交接文档两轮；整理后五个文件五轮；改写（`ee31dbb`）后一轮。按最后一轮意见做的修订未再经审阅。所有审阅和修复都由 AI 模型子代理完成，没有人工审阅。

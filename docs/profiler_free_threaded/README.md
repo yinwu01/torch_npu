@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。使用方崩溃的根因没有确定，接手后先按“接手步骤”确认。
+本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改，修改后还没在 NPU 上重测。
 
 ## 问题
 
@@ -16,7 +16,7 @@
 
 | 候选 | 内容 | 成立条件 | 本分支 |
 |---|---|---|---|
-| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 未修改，接手后第 4 步补上 |
+| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 已确认（NPU 复现）。`1ece90d` 已修改，未在 NPU 上重测 |
 | 2 | 上游 issue #5658：原 `clear()` 在不持有 GIL 时 `Py_DECREF` `TraceContext`。 | 单线程、有 GIL 时也成立 | 已修改：`clear()` 先取 GIL 再释放 |
 | 3 | 三处线程安全问题之一 | 只在并发时成立 | 已修改 |
 
