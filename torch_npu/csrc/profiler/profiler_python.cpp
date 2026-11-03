@@ -813,6 +813,28 @@ static void parseOptimizerParams(
     }
 }
 
+// Since 3.13 frame.f_locals is a FrameLocalsProxy, not a dict, so PyDict_GetItemString
+// returns NULL and the caller crashed on it (same fix as upstream b2e659d62f).
+// Returns nullptr with the error cleared when self is missing: a C++ exception must not
+// leave the profile callback, so callers skip the record instead of throwing.
+static PyObject* lookupSelf(THPObjectPtr& f_locals, THPObjectPtr& holder)
+{
+    if (f_locals.get() == nullptr) {
+        PyErr_Clear();
+        return nullptr;
+    }
+#if PY_MAJOR_VERSION < 3 || (PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION < 13)
+    PyObject* self = PyDict_GetItemString(f_locals.get(), "self");
+#else
+    holder = THPObjectPtr(PyMapping_GetItemString(f_locals.get(), "self"));
+    PyObject* self = holder.get();
+#endif
+    if (self == nullptr) {
+        PyErr_Clear();
+    }
+    return self;
+}
+
 size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
 {
     TORCH_INTERNAL_ASSERT(frame != nullptr, "frame can not be nullptr.", PTA_ERROR(ErrCode::PARAM));
@@ -834,9 +856,12 @@ size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
     if (new_call && record_params_.load(std::memory_order_relaxed)
         && ((PyObject*)f_code.get() == optimizer_call_code_)) {
         auto f_locals = PyFrame_GetLocals_NPU(frame);
-        auto optimizer_class = PyDict_GetItemString(f_locals, "self");
+        THPObjectPtr optimizer_holder;
+        PyObject* optimizer_class = lookupSelf(f_locals, optimizer_holder);
         std::vector<std::pair<size_t, std::vector<OptimizerParam>>> optimizer_params;
-        parseOptimizerParams(optimizer_params, (PyObject*)optimizer_class, hash_id);
+        if (optimizer_class != nullptr) {
+            parseOptimizerParams(optimizer_params, optimizer_class, hash_id);
+        }
         if (!optimizer_params.empty()) {
             TracerLockGuard data_guard(data_mutex_);
             if (active_.load(std::memory_order_relaxed)) {
@@ -850,7 +875,11 @@ size_t PythonTracer::genPyCallHashId(PyFrameObject* frame)
     // check nn.Module call
     if ((PyObject*)f_code.get() == module_call_code_) {
         auto f_locals = PyFrame_GetLocals_NPU(frame);
-        auto module_class = PyDict_GetItemString(f_locals, "self");
+        THPObjectPtr module_holder;
+        PyObject* module_class = lookupSelf(f_locals, module_holder);
+        if (module_class == nullptr) {
+            return hash_id;
+        }
         hash_id = c10::get_hash(module_class);
         bool known = false;
         {

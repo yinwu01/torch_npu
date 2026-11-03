@@ -196,6 +196,8 @@ extern thread_local PyFrameObject* t_current_frame;
 inline PyFrameObject* PyEval_GetFrame() { return t_current_frame; }
 inline PyObject* PyFrame_GetLocals(PyFrameObject*) { return nullptr; }
 inline PyObject* PyDict_GetItemString(PyObject*, const char*) { return nullptr; }
+inline PyObject* PyMapping_GetItemString(PyObject*, const char*) { return nullptr; }
+inline void PyErr_Clear() {}
 
 // ---- THP smart pointers (no refcounting needed in the stub) ----
 template <class T> struct THPPointer {

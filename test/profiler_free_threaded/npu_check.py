@@ -15,6 +15,7 @@
 import argparse
 import faulthandler
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -57,6 +58,7 @@ def main():
     p.add_argument("--threads", type=int, default=1)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--repeat", type=int, default=1)
+    p.add_argument("--keep-output", action="store_true", help="保留每次的 profiler 输出（默认跑完即删，避免占满磁盘）")
     args = p.parse_args()
 
     gil = sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True
@@ -67,6 +69,8 @@ def main():
         out_dir = tempfile.mkdtemp(prefix="npu_check_")
         run_once(args, out_dir)
         print(f"run {i + 1}/{args.repeat} ok, output {out_dir}", flush=True)
+        if not args.keep_output:
+            shutil.rmtree(out_dir, ignore_errors=True)
     print("ALL OK", flush=True)
 
 
