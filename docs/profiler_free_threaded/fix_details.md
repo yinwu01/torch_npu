@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全修复
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上重测：在含 `1ece90d` 的 `9f34a2a` 构建上，`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。三个候选见 [README.md](README.md)。
+本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上编译并运行了含本分支全部代码修改的 `9f34a2a`：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。三个候选见 [README.md](README.md)。
 
 - 代码：`yinwu01/torch_npu`，分支 `fix/profiler-thread-safety`。
 - 基线：`113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
@@ -16,8 +16,8 @@
 | 找到的问题 | 上报链路中有 3 处线程安全问题。对应文件与基线 `46936d1`（TorchNPU 2.13.0）逐字节相同，所以问题不是 r22 分支引入的。 |
 | 为什么 FT 下才暴露 | 有 GIL 时，多个 Python 线程基本依次执行，问题很少暴露。FT 构建下多个线程同时执行，问题就会暴露。 |
 | 修改内容 | 4 个源文件，加一套压力测试。 |
-| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。 |
-| 未完成的验证 | 没有用真实 torch、CPython 3.14、CANN 头文件编译。没有在 NPU 上运行。GIL 构建只做了编译检查。 |
+| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`（torch 2.13.0、CPython 3.14t、CANN toolkit 9.1.0），`npu_check.py` 各次运行都正常退出（[progress.md](progress.md) 2026-11-06）。 |
+| 未完成的验证 | 问题 1、2、3 的修改只在 stub 的 C++ 单元测试中专门测试过。NPU 上的运行没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。GIL 构建只做了编译检查。 |
 
 测试的调用比 `ProfilerMgr` 的实际调用更密集，例如两个线程并发调用 `Stop`。所以原代码失败只说明这些路径有竞态。它不能说明使用方的崩溃来自哪一处。
 
@@ -373,7 +373,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调用 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。worker 如果在 profiler 启动前创建，profiler 不记录它的算子。worker 的数量和创建时机没有核实。影响是结果缺少这些算子数据，没有观察到崩溃。 |
-| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证，torch_npu 上的崩溃未验证。接手后按 [analysis.md](analysis.md) 第 7.1 节第 4 步补上，背景见该文第 4.2 节。 |
+| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证。11-03 在 NPU 上复现了 torch_npu 的崩溃。本分支 `1ece90d` 已补上，11-06 在 NPU 上重测，不再崩溃；修改前的对照构建仍崩溃。背景见 [analysis.md](analysis.md) 第 4.2 节。 |
 | `with_stack` 在 FT 构建下的锁争用 | 彻底解决要改为每个线程一份事件缓冲和缓存。上游 master 已是这种结构。上游每个事件仍获取一次全局 `results_mutex_`，次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.4、5.4 节。 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 有竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能在 `IsMstxDomainEnabled` 中读取。 |
 | `ProfilerMgr` 的其他非原子成员 | `Start/Stop/Init/Finalize` 写入 `path_`、`profConfig_` 等成员。多个线程同时调用这些控制函数时没有保护。 |

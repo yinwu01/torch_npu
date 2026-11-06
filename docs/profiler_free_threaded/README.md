@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上重测：在含 `1ece90d` 的 `9f34a2a` 构建上，`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。
+本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上编译并运行了含本分支全部代码修改的 `9f34a2a`：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。
 
 ## 问题
 
@@ -44,8 +44,10 @@
 | 三处问题的修改（`663e8ba`、`f36d74d`）和压力测试 | 已完成 |
 | 候选方案对比，与上游 `ff5ad88d8a` 的对照 | 已完成 |
 | 候选 1 的修改（`1ece90d`）在 NPU 上重测（[progress.md](progress.md) 2026-11-06） | 已完成 |
-| 接手步骤第 1–4 步 | 待办 |
-| 真实 torch、CPython 3.14t、CANN 编译和 NPU 验证 | 待办 |
+| 接手步骤第 2 步（候选 1） | 已完成 |
+| 接手步骤第 1、3、4 步 | 待办 |
+| 真实 torch、CPython 3.14t、CANN 编译 `9f34a2a`，在 NPU 上运行 `npu_check.py`（[progress.md](progress.md) 2026-11-06） | 已完成 |
+| 问题 1、2、3 的修改在 NPU 上的专门测试 | 待办 |
 | 问题 3 的合入方式（建议以上游为基础，[analysis.md](analysis.md) 第 7.3 节） | 待办 |
 | [fix_details.md](fix_details.md) 第 6 节的其他问题 | 待办 |
 
