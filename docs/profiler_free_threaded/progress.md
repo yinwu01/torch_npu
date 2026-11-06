@@ -1,6 +1,6 @@
 # 进展记录
 
-代码修改、测试和文档已完成。接手后的根因确认、真实环境编译和 NPU 验证都是待办。
+代码修改、测试和文档已完成。候选 1 已在 NPU 上确认，它的修改已在 NPU 上重测。候选 2、3 的确认、真实环境编译和 NPU 验证是待办。
 
 - 对象：分支 `fix/profiler-thread-safety`，基线 `113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
 - 提交时间来自 `git log`，时区 `-0800`。
@@ -25,7 +25,10 @@
 | 与上游 `ff5ad88d8a` 的对照，用本仓库测试运行上游版本 | 已完成 | 无 |
 | 文档目录 | 已完成 | 发现错误时按本文记录 |
 | 向使用方要配置和崩溃时机 | 待办 | [analysis.md](analysis.md) 第 7.1 节第 1 步 |
-| 确认候选 1、2、3；在本分支补 `b2e659d62f` 的 `PyMapping_GetItemString` 和判空部分 | 待办 | [analysis.md](analysis.md) 第 7.1 节第 2–4 步 |
+| 确认候选 1；在本分支补 `b2e659d62f` 的 `PyMapping_GetItemString` 和判空部分（`1ece90d`），在 NPU 上重测 | 已完成 | 无 |
+| 确认候选 2、3 | 待办 | [analysis.md](analysis.md) 第 7.1 节第 3–4 步 |
+| 4 线程运行是否采集到 worker 线程 | 待办 | 结论待定。开始采集后启动的线程可能不被采集（推断） |
+| 测试方 `WORK_REPORT.md` 提到的崩溃路径 `PythonTraceback::gather` | 待办 | 调用栈未提供，原因未查明 |
 | 用真实 torch、CPython 3.14t、CANN 头文件编译 | 待办 | 分别编译 GIL 版和 FT 版 |
 | 在 NPU 上验证 | 待办 | 多线程推理开 profiler，覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup；运行 `test/profiler/` 确认 GIL 版行为不变 |
 | 问题 3 的合入方式 | 待办 | 由接手的工程师或上游维护者决定。建议以上游为基础（[analysis.md](analysis.md) 第 7.3 节） |
@@ -37,6 +40,26 @@
 | 两轮 stop/start 期间漏采一个线程 | 待办 | 已写进代码注释。改用上游方案后不存在 |
 
 ## 进展
+
+### 2026-11-06：在 NPU 上重测候选 1 的修改
+
+- 结果由 NPU 测试方提供。
+- 环境：8 × Ascend950PR，驱动 25.6.rc3，CANN toolkit 9.1.0，Python 3.14.3 free-threaded（`gil_enabled=False`），torch 2.13.0+cpu，aarch64。
+- 本分支构建：torch_npu `2.13.0+git9f34a2a`，含 `1ece90d`。
+  - `python npu_check.py --stack`：退出码 0。
+  - `python npu_check.py --threads 4 --repeat 20 --stack`：退出码 0，20 次全部正常。
+  - `python npu_check.py`（不加 `--stack`）：退出码 0。
+- 对照构建：同一环境，修改前的 torch_npu wheel，版本号 `2.13.0+gitunknown`，10-28 构建，早于 `1ece90d`。
+  - `python npu_check.py --stack`：退出码 139（SIGSEGV）。
+  - C 栈顶：`libtorch_npu.so` 调用 `PyObject_GetAttrString`。`libtorch_npu.so` 没有调试符号，只有偏移。
+  - Python 栈：`torch/nn/modules/module.py` 的 `_wrapped_call_impl` → `npu_check.py` 的 `work`。
+  - 崩溃点与 11-03 的崩溃相同。
+- 结论：`1ece90d` 消除了 NPU 上候选 1 的崩溃。状态：已确认。
+- 注：对照构建是 10-28 的修改前构建，与 11-03 使用的 `2148353` 不完全相同。
+- 未解决：
+  - 4 线程运行不能说明 worker 线程被采集。开始采集后启动的线程可能不被采集（推断）。
+  - 测试方的 `WORK_REPORT.md` 提到另一条崩溃路径 `PythonTraceback::gather`。调用栈未提供，原因未查明。
+- 与本分支修改无关的现象：每次运行都输出 9 条解析任务 "run failed"（`CANNTimelineParser` 和依赖它的 8 个任务）。msprof 日志为 "Current scene of data is based on single_op" 和 "There is no summary data to export"，没有导出 `mindstudio_profiler_output/*.csv`。`CANNTimelineParser` 等待这些 csv；只剩 NON_BLOCKING 任务时，任务管理器按设计停止。开或不开 `--stack` 都出现，修改后的构建上也出现。这是 CANN 一侧的行为，不在本分支范围内。
 
 ### 2026-11-02：按 ASD-STE100 改写本目录
 
@@ -84,5 +107,5 @@
 
 - 代码修改只在 stub 环境中验证过。没有用真实 torch、CPython 3.14t、CANN 头文件编译，没有在 NPU 上运行。
 - 11-03 NPU 结果：`npu_check.py --stack` 单线程 SIGSEGV（退出码 139），栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`，确认候选 1。不开 `with_stack` 的单线程和 4 线程 20 次都正常退出。4 线程开 `with_stack` 跑到第 13 或 14 次时磁盘满，没有崩溃。
-- 候选 1 的修改在 `1ece90d`，未在 NPU 上重测。候选 2、3 是否也会导致崩溃，结论待定。
+- 候选 1 的修改在 `1ece90d`。11-06 NPU 重测：`9f34a2a` 上开 `--stack` 的单线程和 4 线程 20 次都正常退出；修改前的构建在同一环境中 SIGSEGV。`1ece90d` 消除了候选 1 的崩溃，已确认。候选 2、3 是否也会导致崩溃，结论待定。
 - 审阅：代码三轮，每轮两位审阅者；原交接文档两轮；整理后五个文件五轮；改写（`ee31dbb`）后一轮。按最后一轮意见做的修订未再经审阅。所有审阅和修复都由 AI 模型子代理完成，没有人工审阅。

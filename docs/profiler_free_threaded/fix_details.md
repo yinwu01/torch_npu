@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全修复
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改，修改后还没在 NPU 上重测。三个候选见 [README.md](README.md)。
+本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上重测：在含 `1ece90d` 的 `9f34a2a` 构建上，`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。三个候选见 [README.md](README.md)。
 
 - 代码：`yinwu01/torch_npu`，分支 `fix/profiler-thread-safety`。
 - 基线：`113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。

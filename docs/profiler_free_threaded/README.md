@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改，修改后还没在 NPU 上重测。
+本分支修复了 profiler 上报链路中的三处线程安全问题。修复只在 stub 环境中验证过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上重测：在含 `1ece90d` 的 `9f34a2a` 构建上，`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。
 
 ## 问题
 
@@ -16,7 +16,7 @@
 
 | 候选 | 内容 | 成立条件 | 本分支 |
 |---|---|---|---|
-| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 已确认（NPU 复现）。`1ece90d` 已修改，未在 NPU 上重测 |
+| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 已确认（NPU 复现）。`1ece90d` 已修改，11-06 在 NPU 上重测，不再崩溃 |
 | 2 | 上游 issue #5658：原 `clear()` 在不持有 GIL 时 `Py_DECREF` `TraceContext`。 | 单线程、有 GIL 时也成立 | 已修改：`clear()` 先取 GIL 再释放 |
 | 3 | 三处线程安全问题之一 | 只在并发时成立 | 已修改 |
 
@@ -43,6 +43,7 @@
 |---|---|
 | 三处问题的修改（`663e8ba`、`f36d74d`）和压力测试 | 已完成 |
 | 候选方案对比，与上游 `ff5ad88d8a` 的对照 | 已完成 |
+| 候选 1 的修改（`1ece90d`）在 NPU 上重测（[progress.md](progress.md) 2026-11-06） | 已完成 |
 | 接手步骤第 1–4 步 | 待办 |
 | 真实 torch、CPython 3.14t、CANN 编译和 NPU 验证 | 待办 |
 | 问题 3 的合入方式（建议以上游为基础，[analysis.md](analysis.md) 第 7.3 节） | 待办 |
