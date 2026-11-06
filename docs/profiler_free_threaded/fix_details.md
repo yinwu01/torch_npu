@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全修复
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上编译并运行了含本分支全部代码修改的 `9f34a2a`：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。三个候选见 [README.md](README.md)。
+本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上复现了候选 1 的崩溃路径：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。是否为使用方崩溃的原因，结论待定。本分支 `1ece90d` 已修改。11-06 用真实环境编译了含本分支全部代码修改的 `9f34a2a`，并在 NPU 上运行：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。三个候选见 [README.md](README.md)。
 
 - 代码：`yinwu01/torch_npu`，分支 `fix/profiler-thread-safety`。
 - 基线：`113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
@@ -16,8 +16,8 @@
 | 找到的问题 | 上报链路中有 3 处线程安全问题。对应文件与基线 `46936d1`（TorchNPU 2.13.0）逐字节相同，所以问题不是 r22 分支引入的。 |
 | 为什么 FT 下才暴露 | 有 GIL 时，多个 Python 线程基本依次执行，问题很少暴露。FT 构建下多个线程同时执行，问题就会暴露。 |
 | 修改内容 | 4 个源文件，加一套压力测试。 |
-| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`（torch 2.13.0、CPython 3.14t、CANN toolkit 9.1.0），`npu_check.py` 的三次运行都正常退出：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`（[progress.md](progress.md) 2026-11-06）。 |
-| 未完成的验证 | 问题 1、2、3 的修改只在 stub 的 C++ 单元测试中专门测试过。NPU 上的运行没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。GIL 构建只做了编译检查。 |
+| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`（torch 2.13.0、CPython 3.14t、CANN toolkit 9.1.0），`npu_check.py` 的三次运行都正常退出：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`（[progress.md](progress.md) 2026-11-06）。4 线程运行可能没有采集 worker 线程（推断），不作为候选 1 修复的证据。 |
+| 未完成的验证 | 问题 1、2、3 的修改只在 stub 的 C++ 单元测试中专门测试过。NPU 上的运行没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。GIL 构建只做了编译检查。候选 1 的修改只在 3.14.3t 上运行过，3.13 没有测试。Optimizer 分支没有运行。开始采集后启动的线程是否被采集，结论待定。 |
 
 测试的调用比 `ProfilerMgr` 的实际调用更密集，例如两个线程并发调用 `Stop`。所以原代码失败只说明这些路径有竞态。它不能说明使用方的崩溃来自哪一处。
 
@@ -154,7 +154,7 @@ sequenceDiagram
 > [!WARNING]
 > 不要把这四个操作的 `seq_cst` 改弱。改弱后，按 C++ 内存模型，上面的“至少有一种成立”不再有保证。
 > x86 上原子读-改-写指令本身带完整内存屏障，所以压力测试测不出改弱（变异测试 25 次运行全部通过）。
-> aarch64 等内存顺序更弱的平台上可能出错。这一点没有实测。代码注释已写明“不能改弱、x86 和 TSan 下测不出”。
+> aarch64 等内存顺序更弱的平台上可能出错。这一点没有实测。修复后的代码在 aarch64 上运行过 `npu_check.py`，没有专门测试改弱 `seq_cst`。代码注释已写明“不能改弱、x86 和 TSan 下测不出”。
 
 **修改 3：控制操作加锁。**
 
@@ -281,7 +281,17 @@ sequenceDiagram
 - `start()` 给所有线程安装同一个共享 ctx（`shared_ = true`）。安装用 `PyEval_SetProfileAllThreads`，在 STW 期间完成。
 - 共享 ctx 的 `start_py_call_info_`、`ctx_tid_map_` 改用线程 id 作为键（见 `ctxKey()`）。子线程自己注册的 ctx 仍用地址作为键。
 
-GIL 构建中外部可观察的行为不变（推断，没有运行验证）。除 `clear()` 改为获取 GIL 外，其余逻辑修改只在出现竞争时改变执行路径。
+GIL 构建中外部可观察的行为不变（推断，没有运行验证）。除 `clear()` 改为获取 GIL、3.13 及以上读 `self` 的改法（`1ece90d`）外，其余逻辑修改只在出现竞争时改变执行路径。
+
+### 候选 1 的修改（`1ece90d`）
+
+涉及文件：`profiler/profiler_python.cpp`。与线程无关，单线程、有 GIL 时同样成立。背景见 [analysis.md](analysis.md) 第 4.2 节。
+
+- 原代码用 `PyDict_GetItemString` 读 `nn.Module` 帧和 `Optimizer` 帧的 `self`。3.13 起 `f_locals` 不是 `dict`，这个调用返回空指针，随后对空指针取属性而崩溃。CPython C API 的行为已验证。
+- 3.13 及以上改用 `PyMapping_GetItemString`。返回的新引用用 `THPObjectPtr` 持有。3.13 以下保留 `PyDict_GetItemString`。
+- 取不到 `self` 时，清除错误并跳过这条记录。
+- 理由：`pyProfileFn` 没有 try/catch，C++ 异常不能从回调抛出。上游 master 在这里抛异常。出处：`1ece90d` 提交信息。
+- 验证：11-03 在 NPU 上复现了 torch_npu 的崩溃（`2148353`）。11-06 在 3.14.3t 上、在 NPU 上重测，不再崩溃；修改前的对照构建仍崩溃。
 
 ## 4. 验证
 
@@ -314,6 +324,9 @@ GIL 构建中外部可观察的行为不变（推断，没有运行验证）。�
 |---|---|---|---|
 | 原代码 `d3216c2` | 42 | 42 | TSan 数据竞争报告；ASan 报 heap-use-after-free 和 double-free；plain 构建 6 次 SIGSEGV、3 次 SIGABRT；`rb` 丢数据或顺序错乱；部分运行挂起直至超时 |
 | 修复后 `f36d74d` | 42 | 0 | 无 |
+| `1ece90d` | 35 | 0 | 无（出处：提交信息；stub 只编译 3.13 以下分支） |
+
+`1ece90d` 一行在 2026-11-03 运行，数字来自提交信息。35 与 42 不同的原因未记录。
 
 ### 4.3 复现
 
@@ -334,6 +347,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 - stub 与真实 CPython 3.14 不完全一致。真实的 `PyEval_SetProfile` 会触发审计回调。`ModuleInfo`、`parseModuleParams` 调用的 CPython 接口在 stub 中从不报错，所以测试不覆盖它们抛 Python 异常的路径。
 - GIL 路径只编译，不运行。
+- stub 只编译 3.13 以下的分支，`1ece90d` 的 3.13 及以上分支只有 NPU 运行覆盖。
 - `ProfilerMgr` 没有编译进测试。
 - 测试检出回归的能力有限。变异测试每项 25 次运行：去掉 `WaitWriters` 失败 2 次；去掉 `Report` 中的二次检查失败 1 次；恢复原来的 `Run` 循环失败 0 次；把 `seq_cst` 改弱失败 0 次。完整列表见 [learning.md](learning.md) A4.3。
 
@@ -351,6 +365,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 可用容量从 capacity-1 变为 capacity。非 2 的幂的容量向上取整。 | 新队列的写法 |
 | 采集运行中调用 `Init`：记一条错误日志，先停止并把数据写完到旧路径，再按新路径初始化。原代码直接在运行中的缓冲区上重新分配。 | 避免在写入方访问时重新分配缓冲区 |
 | `UnInit` 遇到仍在运行的上报器时，先停止并写完数据。 | 析构路径同样需要安全 |
+| 3.13 及以上，取不到 `nn.Module` 或 `Optimizer` 帧的 `self` 时跳过该记录。原代码对 NULL 取属性而崩溃。 | 候选 1 |
 
 ### 5.2 只影响 FT 构建
 
@@ -373,17 +388,18 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 问题 | 说明 |
 |---|---|
 | host regions 的 worker 线程上的算子可能采集不到 | 算子回调用 `addThreadLocalCallback` 注册（`npu_profiler.cpp:260`），只对持有 profiler 线程状态的线程生效。worker 如果在 profiler 启动前创建，profiler 不记录它的算子。worker 的数量和创建时机没有核实。影响是结果缺少这些算子数据，没有观察到崩溃。 |
-| 基线缺少上游 `b2e659d62f`，3.13 及以上读 `self` 得到空指针 | 与线程无关，单线程、有 GIL 时同样成立。CPython C API 的行为已验证。11-03 在 NPU 上复现了 torch_npu 的崩溃。本分支 `1ece90d` 已补上，11-06 在 NPU 上重测，不再崩溃；修改前的对照构建仍崩溃。背景见 [analysis.md](analysis.md) 第 4.2 节。 |
 | `with_stack` 在 FT 构建下的锁争用 | 彻底解决要改为每个线程一份事件缓冲和缓存。上游 master 已是这种结构。上游每个事件仍获取一次全局 `results_mutex_`，次数更少、持有时间更短，见 [analysis.md](analysis.md) 第 4.4、5.4 节。 |
 | `ProfilerMgr` 的 `mstx_domain_include_/exclude_` 有竞态 | `Start/Stop` 修改这两个 `std::vector` 时，其他线程可能在 `IsMstxDomainEnabled` 中读取。 |
 | `ProfilerMgr` 的其他非原子成员 | `Start/Stop/Init/Finalize` 写入 `path_`、`profConfig_` 等成员。多个线程同时调用这些控制函数时没有保护。 |
 | GIL 构建中 `record_params_` 沿用到下一次采集 | 上游原有的问题。修复会改变 GIL 构建的行为，所以没有改。 |
 | fork 出的子进程中停止采集可能无限等待 | fork 时如果有写入方在 `Report` 中，子进程继承的 `writers_` 永远大于 0，`WaitWriters` 不返回。代码注释已写明。 |
 | 一次 `startOne` 期间经历两轮完整的 stop/start 时，profiler 在最新一轮会话中不采集该线程 | `startOne` 只重试一次。代码注释已写明。 |
+| 开始采集后启动的线程是否被采集 | 结论待定。`npu_check.py` 的 4 线程运行在 `profile()` 内启动 worker 线程，这些线程可能不被采集（推断）。 |
+| 崩溃路径 `PythonTraceback::gather` | 出处已丢失（测试方找不到 `WORK_REPORT.md`），原因未查明。 |
 
 ## 7. 接手后的步骤
 
-1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处。候选 1 已在 NPU 上确认，候选 2、3 结论待定。`b2e659d62f` 的 `PyMapping_GetItemString` 和判空部分已在本分支 `1ece90d` 补上，11-06 在 NPU 上重测，不再崩溃。
+1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处。候选 1 的崩溃路径已在 NPU 上复现（单线程、`--stack`），是否为使用方崩溃的原因，结论待定。候选 2、3 结论待定。本分支 `1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 4 步的修改做法”后的警告），11-06 重测不再崩溃。
 2. 决定合入方式：
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master。上游这两处逻辑与 2.13.0 相同，但做过 clang-format。补丁不能直接 `git apply`，要手工合入。这些修改没有在 master 上编译过。
    - 问题 3 建议以上游 `ff5ad88d8a` 为基础，并补四处修改。理由和修改内容见 [analysis.md](analysis.md) 第 7.3 节。
@@ -397,5 +413,5 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | `torch_npu/csrc/toolkit/profiler/common/ring_buffer.h` | 问题 2：每个槽位带序号的有界队列 |
 | `torch_npu/csrc/toolkit/profiler/inc/data_dumper.h` | 问题 1：新增 `writers_`、`control_mutex_`、`extra_data_mutex_`、`create_dir_flag_` |
 | `torch_npu/csrc/toolkit/profiler/src/data_dumper.cpp` | 问题 1：登记、等待、加锁的停止流程 |
-| `torch_npu/csrc/profiler/profiler_python.cpp` | 问题 3：FT 构建下加锁、会话计数、ctx 生命周期 |
+| `torch_npu/csrc/profiler/profiler_python.cpp` | 问题 3：FT 构建下加锁、会话计数、ctx 生命周期；候选 1：3.13 及以上读 `self`（`1ece90d`） |
 | `test/cpp/profiler_thread_safety/` | 压力测试、stub 头文件、运行脚本 `run.py` |

@@ -1,6 +1,6 @@
 # torch_npu profiler 在 free-threaded Python 下的线程安全
 
-本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上确认了候选 1：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。本分支 `1ece90d` 已修改。11-06 在 NPU 上编译并运行了含本分支全部代码修改的 `9f34a2a`：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。
+本分支修复了 profiler 上报链路中的三处线程安全问题。这三处修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-03 在 NPU 上复现了候选 1 的崩溃路径：`npu_check.py --stack` 在 `2148353` 上 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`。是否为使用方崩溃的原因，结论待定。本分支 `1ece90d` 已修改。11-06 用真实环境编译了含本分支全部代码修改的 `9f34a2a`，并在 NPU 上运行：`npu_check.py --stack` 正常退出；修改前的构建在同一环境中仍 SIGSEGV。这些运行中没有专门触发三处线程安全问题的测试。
 
 ## 问题
 
@@ -10,15 +10,15 @@
 
 - 静态阅读上报链路，找到三处线程安全问题，在本分支修复（[fix_details.md](fix_details.md)）。
 - stub 环境的压力测试：原代码 42 次场景运行全部失败，修复后 42 次全部通过。
-- 上游对照时发现两处在单线程、有 GIL 时同样成立的问题。本分支已修改其中一处。
+- 上游对照时发现两处在单线程、有 GIL 时同样成立的问题。本分支已修改这两处（`663e8ba`、`1ece90d`）。
 
 ## 崩溃根因的三个候选
 
 | 候选 | 内容 | 成立条件 | 本分支 |
 |---|---|---|---|
-| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 已确认（NPU 复现）。`1ece90d` 已修改，11-06 在 NPU 上重测，不再崩溃 |
-| 2 | 上游 issue #5658：原 `clear()` 在不持有 GIL 时 `Py_DECREF` `TraceContext`。 | 单线程、有 GIL 时也成立 | 已修改：`clear()` 先取 GIL 再释放 |
-| 3 | 三处线程安全问题之一 | 只在并发时成立 | 已修改 |
+| 1 | 基线缺少上游 `b2e659d62f`。3.13 及以上读 `nn.Module` 帧的 `self` 得到空指针，随后对空指针取属性。 | 单线程、有 GIL 时也成立 | 崩溃路径已在 NPU 上复现（单线程、`--stack`）。是否为使用方崩溃的原因，结论待定。`1ece90d` 已修改，11-06 重测不再崩溃 |
+| 2 | 上游 issue #5658：原 `clear()` 在不持有 GIL 时 `Py_DECREF` `TraceContext`。 | 单线程、有 GIL 时也成立 | 已完成（`663e8ba`）：`clear()` 先取 GIL 再释放 |
+| 3 | 三处线程安全问题之一 | 只在并发时成立 | 已完成（`663e8ba`、`f36d74d`） |
 
 按配置排除（推断，[analysis.md](analysis.md) 第 1.5 节）：
 
@@ -30,9 +30,9 @@
 完整步骤、流程图和诊断手段见 [analysis.md](analysis.md) 第 7.1 节。
 
 1. 向使用方要 profiler 配置、是否多线程和崩溃时机。
-2. 在原构建上运行单线程最小脚本，用 gdb 栈顶检查候选 1。
-3. 在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 和判空部分。单线程含停止采集，检查候选 1、2；多线程重复运行，检查候选 3。
-4. 在本分支补同一处修改，用第 3.2 步的用例运行。只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认修复。
+2. 在原构建上运行单线程最小脚本（`npu_check.py --stack`，见“文件”一节），用 gdb 栈顶检查候选 1。
+3. 在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 4 步的修改做法”后的警告）。单线程含停止采集，检查候选 1、2；多线程重复运行，检查候选 3。
+4. 本分支已补同一处修改（`1ece90d`）。用第 3.2 步的用例运行。只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认修复。
 
 > [!WARNING]
 > 按 gdb 栈顶或 ASan 报告的位置判断原因，不按是否崩溃判断。多线程用例要重复运行。
@@ -63,6 +63,8 @@
 | [progress.md](progress.md) | 状态表和进展记录 |
 
 测试代码在 [`test/cpp/profiler_thread_safety/`](../../test/cpp/profiler_thread_safety)。运行方法见 [fix_details.md](fix_details.md) 第 4.3 节。依赖：Linux，g++（C++17），Python 3.8 以上。不需要 torch、CANN、NPU、网络。
+
+NPU 检查脚本：[`test/profiler_free_threaded/npu_check.py`](../../test/profiler_free_threaded/npu_check.py)。依赖：Python 3.14t，torch 2.13.0，待测的 torch_npu，一张 NPU，不需要网络。`--stack` 同时开启 `with_stack` 和 `with_modules`。
 
 ## 术语
 
@@ -103,7 +105,8 @@
 | 变异测试 | 故意把某处修复改回错误写法，检查测试能否发现。 |
 | 变体 / 参照变体 | 按候选方案改写的源码副本 / 去掉部分同步、不是有效修复的副本，只用于给出开销的参照值。 |
 | host regions、r22 分支 | 基线所带的实验特性和它所在的分支，见 [`host_regions_r22.md`](../experimental_free_threaded/host_regions_r22.md)。 |
-| 状态 | 已验证：读过原文、运行过命令或测试。推断：只根据阅读代码得出。未验证：没有核实。 |
+| 核实状态 | 用于事实。已验证：读过原文、运行过命令或测试。推断：只根据阅读代码得出。未验证：没有核实。 |
+| 事项状态 | 用于工作事项。已完成、进行中、待办。 |
 
 ## 分支上的提交
 
@@ -115,8 +118,11 @@
 | [`f36d74d`](https://github.com/yinwu01/torch_npu/commit/f36d74df1e4daf3af7e81387f1d367abc1fbaee0) | `startOne` 的 ctx 引用在异常路径上泄漏；在 `data_dumper.cpp` 注释中写明 `seq_cst` 要求和 fork 限制 |
 | [`675f2e9`](https://github.com/yinwu01/torch_npu/commit/675f2e9c5aa096da70cd649ca4dc00dd28b68a18) | 交接文档（现在的 `fix_details.md`） |
 | [`da752e6`](https://github.com/yinwu01/torch_npu/commit/da752e6a12e87e79095da4f23050cb1f81833533) | 更正交接文档中对上游方案的概括和审阅条目统计 |
-| `87dcd0e`、`d1bbbad` 及之后 | 本目录 |
+| [`d2a3f84`](https://github.com/yinwu01/torch_npu/commit/d2a3f849b66302c851842c3c86a54552524148e8) | 新增 `test/profiler_free_threaded/npu_check.py` |
+| [`1ece90d`](https://github.com/yinwu01/torch_npu/commit/1ece90db455b51dc82ac3b46cb1ce53e370809ce) | 3.13 及以上用 `PyMapping_GetItemString` 读 `self`，取不到时跳过；`npu_check.py` 加 `--keep-output` |
+| [`090c9ef`](https://github.com/yinwu01/torch_npu/commit/090c9ef6d05cdbc936a5de3d526ea087f11656ae) | `npu_check.py` 加 `--export {text,db}` 和每次运行的产物清单 |
+| 其余提交 | 本目录的文档 |
 
 ## 交付状态
 
-代码经过三轮审阅，文档经过多轮审阅，全部由 AI 模型子代理完成，没有人工审阅。改写（`ee31dbb`）后又经过一轮独立审阅，按该轮意见做的修订未再经审阅。经过见 [progress.md](progress.md)。
+代码经过三轮审阅，文档经过多轮审阅，全部由 AI 模型子代理完成，没有人工审阅。改写（`ee31dbb`）后经过两轮独立审阅。按第二轮意见做的修订（`2148353`）和之后的提交（`d2a3f84` 至 `4f5bff0`）未经审阅。代码的三轮审阅只覆盖 `663e8ba`、`f36d74d`。经过见 [progress.md](progress.md)。

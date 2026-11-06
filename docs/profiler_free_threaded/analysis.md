@@ -8,8 +8,8 @@
 
 说明：
 
-- 对应提交 `663e8ba`、`f36d74d`。问题编号与 [fix_details.md](fix_details.md) 一致。术语和“状态”列的取值见 [README.md](README.md)。
-- 代码事实来自本仓库 `f36d74d` 和上游文件（2026-11-02）。测量在本机 stub 环境中完成。
+- 对应提交 `663e8ba`、`f36d74d`、`1ece90d`。问题编号与 [fix_details.md](fix_details.md) 一致。术语和“状态”列的取值（核实状态）见 [README.md](README.md)。
+- 代码事实来自本仓库 `f36d74d` 和上游文件（2026-11-02）。`1ece90d` 改了读 `self` 的部分，见第 4.2 节。测量在本机 stub 环境中完成。
 - 第 2、3、5 节的测量在 2026-11-02 03:58 至 04:23（`-0800`）完成。
 - 这些测量晚于修复提交（`663e8ba` 02:47，`f36d74d` 03:07）和最初的文档（`675f2e9` 03:48，`da752e6` 03:51），属于事后核对。方案选择依据推理。
 - 例外：第 2.1 节的 02:33 测量早于修复提交。保留 `writers_` 时参考过它。
@@ -199,7 +199,7 @@
 
 上游 `b2e659d62f`（2026-08-21，`!43955`，issue #3808，已关闭）把 `PyDict_GetItemString` 改为 `PyMapping_GetItemString`。原因：3.13 起 `PyFrame_GetLocals` 返回 `PyFrameLocalsProxy_Type` 实例。它还修复了 3.12 下 `with_stack` 的析构错误。
 
-本分支（`d3216c2` 和 `f36d74d` 相同）用 `PyDict_GetItemString(f_locals, "self")` 读 `nn.Module.__call__` 帧和 `Optimizer` step 帧的 `self`（`f36d74d` 第 837、853 行），取不到时不判空。状态：已验证。
+`d3216c2` 和 `f36d74d` 用 `PyDict_GetItemString(f_locals, "self")` 读 `nn.Module.__call__` 帧和 `Optimizer` step 帧的 `self`（`f36d74d` 第 837、853 行），取不到时不判空。状态：已验证。`1ece90d` 起，3.13 及以上改用 `PyMapping_GetItemString`，取不到时清除错误并跳过本条记录。
 
 ```cpp
 auto module_class = PyDict_GetItemString(f_locals, "self");
@@ -222,11 +222,12 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 |---|---|
 | 3.14.3t 上 `PyObject_GetAttrString(NULL, "__class__")` 以 SIGSEGV 退出（退出码 139）。输出只记录了 `exit=139`，没有记录 `sys.version` 和 `Py_GIL_DISABLED`，所以“在 3.14.3t 上”无法从日志核对。重新运行时记录这两项。 | 已验证 |
 | pybind11 的 `handle(nullptr).attr` 调用这个函数 | 推断 |
-| 3.13 及以上开启 `with_stack` 或 `with_modules`，第一次 `nn.Module` 调用时崩溃，与线程数无关，GIL 构建同样成立。3.13 没有实测，依据 PEP 667。 | 推断 |
+| 3.14.3t（FT）单线程开 `--stack` 时，第一次 `nn.Module` 调用崩溃 | 已验证（NPU，11-03） |
+| 3.13 和 GIL 构建同样崩溃 | 推断，依据 PEP 667 |
 | 3.13 及以上，开启 `with_stack` 或 `with_modules`，且 `record_params_` 为真时（`profile_memory` 且 `record_shapes`），Optimizer 分支对 NULL 调用 `parseOptimizerParams` | 推断 |
 | `ff5ad88d8a` 保留 `PyMapping_GetItemString`，取不到时抛 `KeyError`；去掉“3.12 及以上跳过 `Py_DECREF`”，改由 `releaseContext()` 持 GIL 释放共享 ctx | 已验证 |
 
-- 使用方的现象与这条路径相符。但没有在 torch_npu 上运行确认。
+- 11-03 在 NPU 上用 torch_npu 复现了这条路径（`2148353`，单线程开 `--stack`）。使用方的崩溃是否来自这里，结论待定。
 - 如果崩溃出在这里，gdb `bt` 的栈顶在 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
 - 压力测试没有发现它。原因：stub 的 `py::handle::attr` 不访问对象。
 
@@ -260,7 +261,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | CPython 私有接口 | 不调用私有函数。直接读 `c_profilefunc`（第 518、592、628 行，上游和 `d3216c2` 也读）和 `c_profileobj`（第 560 行，只有本分支读）。字段在 `Include/cpython/pystate.h` 的 `struct _ts` 中（3.14.3 第 134、136 行），布局不属于稳定接口（已验证） | FT 3.14 及以上：`_PyEval_StopTheWorld`，自行 `extern "C"` 声明（60–62 行）。3.9–3.12：`_PyEval_SetProfile` |
 | GIL 构建的行为变化（推断） | 只有 `clear()` 改为获取 GIL | 不再有 `max_threads`（原默认 256）；`stop()` 清除其他工具的 profile 函数；每个事件多一次查表、`shared_ptr` 复制和 `try_lock` |
 | FT 热路径 | 每次调用至少两次 `data_mutex_`；`nn.Module` 帧多一次（第 851–859 行）；到阈值时在锁内上传 | 每个事件一次 `results_mutex_`，一次本线程 `callback_mutex_` 的 `try_lock`（获取失败时不记录）。上传时取 `report_mutex_` |
-| 3.13 及以上读 `self` | `PyDict_GetItemString`，返回 NULL | `PyMapping_GetItemString`，取不到时抛 `KeyError`，由 `catch (...)` 丢弃（640–681、752 行） |
+| 3.13 及以上读 `self` | `PyDict_GetItemString`，返回 NULL。`1ece90d` 起改用 `PyMapping_GetItemString`，取不到时跳过 | `PyMapping_GetItemString`，取不到时抛 `KeyError`，由 `catch (...)` 丢弃（640–681、752 行） |
 | ctx 释放时持有 GIL（#5658） | 是，`clear()` 获取 GIL | 是，`releaseContext()` 获取 GIL（424–430 行） |
 | 3.13t | 与 3.14t 同一套代码 | 只告警 `"The Python tracer is not thread-safe on Python 3.13t. Please use Python 3.14t or later."`，不做 STW |
 | 同线程重入 | `control_mutex_` 检测到同线程重入时抛出异常。`startOne/stopOne` 不取 `control_mutex_`，可以从 `start()` 的帧遍历中调用 | 没有检测。同一线程对 `std::mutex` 再次加锁是未定义行为，glibc 上死锁（第 5.3 节已复现） |
@@ -292,7 +293,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 上游 | 3.13t 只告警，仍有读其他线程栈的竞态 | 读代码 |
 | 上游 | FT 构建每个事件取一次全局 `results_mutex_` | 读代码；stub 吞吐见第 5.4 节 |
 | 上游 | 等 `results_mutex_` 时不 detach。以后在持有它时引入 Python 调用或 STW 会死锁 | 推断 |
-| 本分支 | 曾缺少 `PyMapping_GetItemString` 修改，`1ece90d` 已补上 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分 | 已验证（NPU）：11-03 不含这处修改的 `2148353` 以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 含 `1ece90d` 的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃 |
+| 本分支 | 曾缺少 `PyMapping_GetItemString` 修改。`1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 4 步的修改做法”后的警告） | 已验证。NPU 上的运行：11-03 不含这处修改的 `2148353` 以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 含 `1ece90d` 的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃 |
 | 本分支 | 读 `c_profilefunc`、`c_profileobj`，布局可能随小版本变化 | 读代码 |
 | 本分支 | FT 下每次调用至少两次全局 `data_mutex_` | 第 5.4 节 |
 | 本分支 | `session_` 逻辑复杂；两轮 stop/start 期间漏采一个线程 | 代码注释已写明 |
@@ -449,7 +450,7 @@ flowchart TD
     CX --> S32
     D31 -->|不终止| S32["第 3.2 步：多线程，重复运行，有条件时用 ASan 构建。先关闭 with_stack 和 with_modules 一组，再按使用方配置一组"]
     S32 --> D32{"复现崩溃？"}
-    D32 -->|"是，按栈顶或 ASan 位置判断归属"| S4["第 4 步：本分支补同一处修改，用第 3.2 步的用例和次数运行"]
+    D32 -->|"是，按栈顶或 ASan 位置判断归属"| S4["第 4 步：在本分支（已含 1ece90d）上用第 3.2 步的用例和次数运行"]
     D32 -->|否| S4N["第 4 步照常做，但结果不能确认本分支的修复"]
     S4 --> D4{"不再崩溃？"}
     D4 -->|是| OK["确认本分支的修复"]
@@ -465,7 +466,7 @@ flowchart TD
    - 如果第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。
    - 只看到前向崩溃，不足以区分候选 1 和候选 3 中的问题 2。单个 Python 线程时仍有 C++ 写入方。
    - 候选 1 成立时，进程执行不到停止采集，所以这一步看不到候选 2。
-3. **在原构建上只补 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分。** 重新编译，然后：
+3. **在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 4 步的修改做法”后的警告）。** 重新编译，然后：
    1. 在 gdb 下重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。
       - 如果第 2 步在前向时崩溃、这里不再崩溃，确认候选 1。
       - 如果停止采集时终止，且栈顶往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者报 `_PyMem_DebugFree` 错误，对应候选 2。
@@ -474,10 +475,10 @@ flowchart TD
       - 先关闭 `with_stack` 和 `with_modules` 运行一组。这时 `PythonTracer` 不启动，只剩候选 3 的问题 1、2。
       - 再按使用方的配置运行一组。
       - 按栈顶或 ASan 报告的位置判断归属。
-4. **在本分支上补同一处修改，作为独立提交。** 编译本分支。用第 3.2 步的同一组用例、同样的重复次数运行。
+4. **本分支已在 `1ece90d` 补上这处修改。** 编译本分支，用第 3.2 步的同一组用例、同样的重复次数运行。
    - 只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认本分支的修复。
    - 另外覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置，确认能正常导出结果。
-   - 本分支已在 `1ece90d` 补上这处修改。不含它的构建会先遇到候选 1：11-03 在 NPU 上，`2148353` 开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
+   - 不含 `1ece90d` 的构建会先遇到候选 1：11-03 在 NPU 上，`2148353` 开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
 
 **第 4 步的修改做法：**
 
@@ -518,7 +519,7 @@ flowchart TD
 1. **维护成本。** 本分支的补丁改的是上游重构前的结构，不能直接合入。维护两套写法，每次同步上游都要重新合并。
 2. **结构更简单。** 一把控制锁覆盖五个入口，不需要 `session_` 和重试，没有“两轮 stop/start 期间漏采一个线程”的限制。回调写本线程的对象，生命周期由 `shared_ptr` 和 `callback_mutex_` 保证，更容易检查。
 3. **争用更少。** 缓存和事件存在每线程对象中。全局锁只剩一次短临界区（每个事件一次 `results_mutex_`，第 4.4 节）。stub 环境下多线程时上游吞吐更高（模块帧 2 个线程时重叠，第 5.4 节）。可以把 `findThreadLocalResult` 改为线程局部缓存（按会话编号校验）来进一步减少争用，上游和本文都没有做。
-4. **已包含** `PyMapping_GetItemString` 修改和 #5658 的修改。
+4. **已包含** `PyMapping_GetItemString` 修改和 #5658 的修改。本分支在 `1ece90d` 后同样包含这两处，这一条不再是两者的差别。
 
 合入 2.13.0 或 r22 分支时，同时做下面四处修改：
 
@@ -532,9 +533,11 @@ flowchart TD
 ## 8. 未解决的问题
 
 - 使用方的崩溃出在哪一处，没有确定（第 1.5、7.1 节）。
-- 11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN toolkit 9.1.0 编译了 `9f34a2a`（含 `663e8ba`、`f36d74d`、`1ece90d`），在 NPU 上运行了三次 `npu_check.py`：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`。三次退出码都是 0（[progress.md](progress.md) 2026-11-06）。
+- 11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN toolkit 9.1.0 编译了 `9f34a2a`（含 `663e8ba`、`f36d74d`、`1ece90d`），在 NPU 上运行了三次 `npu_check.py`：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`。三次退出码都是 0（[progress.md](progress.md) 2026-11-06）。`npu_check.py` 在 `profile()` 内才启动 worker 线程，`nn.Module` 只在 worker 线程里调用；这些线程可能不被采集（推断），所以 4 线程运行不作为候选 1 修复的证据。11-03 不含修复的 `2148353` 跑 4 线程开 `--stack` 到第 14 次没有崩溃，和推断相符。
 - 三处线程安全修改只在 stub 的 C++ 单元测试中专门测试过。GIL 构建只做了编译检查。
 - 第 4.2 节的路径在 NPU 上用 torch_npu 运行过：11-03 `2148353`（不含 `1ece90d`）开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 重测了 `1ece90d` 的修改：含它的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃（[progress.md](progress.md) 2026-11-06）。`npu_check.py` 不调用 Optimizer，也不开 `profile_memory` 和 `record_shapes`，所以 Optimizer 分支没有在 NPU 上运行。
+- 开始采集后启动的线程是否被采集，结论待定。
+- 崩溃路径 `PythonTraceback::gather`：出处已丢失（测试方找不到 `WORK_REPORT.md`），原因未查明。
 - 上游 PR 的验证截图没有查看。上游是否有 FT 测试，没有核实。
 - 嵌套 STW 只读了源码。上游 STW 期间的属性访问在实际模型上是否执行字节码，没有验证。
 - 上游 `init.cpp` 的 GIL 处理只依据 `6ca3a36a15` 的 PR 描述：GIL 释放移到绑定处，用 `py::call_guard<py::gil_scoped_release>()`。按此描述，上游 tracer 的 `start/stop/clear` 仍在已释放 GIL 的线程上调用。`init.cpp` 没有查看。

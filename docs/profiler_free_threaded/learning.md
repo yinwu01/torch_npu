@@ -108,7 +108,7 @@ A 部分列出维护这次修改需要的背景知识，每条附官方出处。
   - x86 上 seq_cst 读取是 `MOV`，seq_cst 存储是带锁的 `XCHG`。
   - AArch64 上 acquire/seq_cst 读取是 `LDAR`，release/seq_cst 存储是 `STLR`，读-改-写是 `ldaxr`/`stlxr` 循环。
 - x86-TSO：带 `LOCK` 前缀的指令结束时清空存储缓冲区。
-- 与本次的关系：x86 上 `fetch_add` 不论内存顺序参数都编译为带 `LOCK` 的指令。所以写入方改成 `fetch_add(relaxed)` 加 `load(acquire)` 后（m11），x86 上 25 次全部通过。AArch64 上 relaxed 的读-改-写没有 acquire/release 语义。按 C++ 模型，“至少一个成立”不再有保证。aarch64（如鲲鹏）上是否实际出错，没有实测。
+- 与本次的关系：x86 上 `fetch_add` 不论内存顺序参数都编译为带 `LOCK` 的指令。所以写入方改成 `fetch_add(relaxed)` 加 `load(acquire)` 后（m11），x86 上 25 次全部通过。AArch64 上 relaxed 的读-改-写没有 acquire/release 语义。按 C++ 模型，“至少一个成立”不再有保证。aarch64（如鲲鹏）上是否实际出错，没有实测。修复后的代码在 aarch64 上运行过 `npu_check.py`，没有专门测试改弱 `seq_cst`。
 - 出处：<https://en.cppreference.com/w/cpp/atomic/memory_order>，<https://www.cl.cam.ac.uk/~pes20/cpp/cpp0xmappings.html>，<https://www.cl.cam.ac.uk/~pes20/weakmemory/cacm.pdf>
 
 ### A3. Vyukov 有界队列
@@ -231,7 +231,7 @@ A 部分列出维护这次修改需要的背景知识，每条附官方出处。
 - `ModuleInfo`、`parseModuleParams`、`parseOptimizerParams`、`py::repr` 调用的接口在 stub 中从不报错。
 - 所以抛 Python 异常的路径没有测试覆盖。`f36d74d` 修复的泄漏就在这条路径上。仓库测试没有发现它，审阅者另写的 `exc_leak.cpp` 发现了它。
 - GIL 路径只编译、不运行。“有 GIL 时行为不变”只来自阅读代码。
-- `ProfilerMgr` 没有编译进测试。没有用真实 torch、CPython 3.14、CANN 头文件编译。
+- `ProfilerMgr` 没有编译进测试。stub 测试没有用真实头文件。11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN 9.1.0 头文件编译了 `9f34a2a`（[progress.md](progress.md) 2026-11-06）。GIL 版没有用真实头文件编译。
 - stub 的 `py::handle::attr` 不访问对象。所以测试没有发现 [analysis.md](analysis.md) 第 4.2 节的空指针访问。
 
 做法：
@@ -240,7 +240,7 @@ A 部分列出维护这次修改需要的背景知识，每条附官方出处。
    - `PyEval_SetProfile*` 替换回调前执行一个回调。
    - `py::object::attr` 可注入异常。
 2. 真实实现对非法输入报错或崩溃时，stub 也要表现出来。
-3. 在有真实 torch 和 CPython 3.14t 的机器上至少编译一次。环境见 [analysis.md](analysis.md) 第 7.1 节“准备”。
+3. 在有真实 torch 和 CPython 3.14t 的机器上至少编译一次。环境见 [analysis.md](analysis.md) 第 7.1 节“准备”。FT 版已完成（11-06）；GIL 版待办。
 4. 在同一机器上运行一次 GIL 构建的原有 profiler 测试（[fix_details.md](fix_details.md) 第 7 节）。
 
 ### B4. 设计之前没有查上游最新代码
