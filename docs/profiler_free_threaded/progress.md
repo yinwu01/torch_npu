@@ -31,7 +31,7 @@
 | 测试方 `WORK_REPORT.md` 提到的崩溃路径 `PythonTraceback::gather` | 待办 | 调用栈未提供，原因未查明 |
 | FT 版编译：用真实 torch、CPython 3.14t、CANN 头文件编译 `9f34a2a` | 已完成 | 无 |
 | GIL 版编译：用真实 torch、CPython 3.14、CANN 头文件编译 | 待办 | 与 FT 版分别编译 |
-| 在 NPU 上运行 `npu_check.py`（`9f34a2a`，开和不开 `--stack`，单线程和 4 线程 × 20 次） | 已完成 | 无 |
+| 在 NPU 上运行 `npu_check.py`（`9f34a2a`，三次：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`） | 已完成 | 无 |
 | 在 NPU 上专门测试问题 1、2、3 的修改 | 待办 | 多线程推理开 profiler，覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup；运行 `test/profiler/` 确认 GIL 版行为不变 |
 | 问题 3 的合入方式 | 待办 | 由接手的工程师或上游维护者决定。建议以上游为基础（[analysis.md](analysis.md) 第 7.3 节） |
 | host regions 的 worker 线程算子可能采集不到 | 待办 | 核实 worker 的数量和创建时机 |
@@ -108,7 +108,7 @@
 
 ## 交付状态
 
-- 问题 1、2、3 的修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`，`npu_check.py` 各次运行（开和不开 `--stack`，单线程和 4 线程 20 次）都正常退出，但没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。
+- 问题 1、2、3 的修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`，`npu_check.py` 的三次运行（单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`）都正常退出，但没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。
 - 11-03 NPU 结果：`npu_check.py --stack` 单线程 SIGSEGV（退出码 139），栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`，确认候选 1。不开 `with_stack` 的单线程和 4 线程 20 次都正常退出。4 线程开 `with_stack` 跑到第 13 或 14 次时磁盘满，没有崩溃。
 - 候选 1 的修改在 `1ece90d`。11-06 NPU 重测：`9f34a2a` 上开 `--stack` 的单线程和 4 线程 20 次都正常退出；修改前的构建在同一环境中 SIGSEGV。`1ece90d` 消除了候选 1 的崩溃，已确认。候选 2、3 是否也会导致崩溃，结论待定。
 - 审阅：代码三轮，每轮两位审阅者；原交接文档两轮；整理后五个文件五轮；改写（`ee31dbb`）后一轮。按最后一轮意见做的修订未再经审阅。所有审阅和修复都由 AI 模型子代理完成，没有人工审阅。

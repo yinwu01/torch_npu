@@ -298,7 +298,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 本分支 | `session_` 逻辑复杂；两轮 stop/start 期间漏采一个线程 | 代码注释已写明 |
 | 本分支 | 与上游结构不同，以后同步要手工合并 | 已验证 |
 | 本分支 | 锁只在 FT 构建生效，GIL 构建依赖 GIL。GIL 构建只编译，没有运行 | [fix_details.md](fix_details.md) 第 4.4、5.2 节 |
-| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；没有在 NPU 上运行 | 读代码 |
+| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；上游没有在 NPU 上运行；本分支 `9f34a2a` 在 NPU 上运行过 `npu_check.py`，没有专门测试这一行为 | 读代码 |
 
 嵌套 STW 的依据（读 CPython v3.14.3 源码，没有运行）：`stop_the_world()` 先执行 `PyMutex_Lock(&stw->mutex)`（`pystate.c` 2372 行），不可重入。FT 的垃圾回收调用 `_PyEval_StopTheWorld`（`gc_free_threading.c` 2185 行），由 `_Py_ScheduleGC` 推迟到线程处理待办事件时执行（2152 行）。`sys._current_frames()` 也在 STW 期间读帧（推断）。“STW 期间执行字节码”没有找到先例。
 
@@ -532,7 +532,8 @@ flowchart TD
 ## 8. 未解决的问题
 
 - 使用方的崩溃出在哪一处，没有确定（第 1.5、7.1 节）。
-- 没有用真实 torch、CPython 3.14t 头文件编译任何版本。没有在 NPU 上运行。
+- 11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN toolkit 9.1.0 编译了 `9f34a2a`（含 `663e8ba`、`f36d74d`、`1ece90d`），在 NPU 上运行了三次 `npu_check.py`：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`。三次退出码都是 0（[progress.md](progress.md) 2026-11-06）。
+- 三处线程安全修改只在 stub 的 C++ 单元测试中专门测试过。GIL 构建只做了编译检查。上游版本没有在真实环境中编译和运行。
 - 第 4.2 节只验证了 C API 行为，没有运行 torch_npu。
 - 上游 PR 的验证截图没有查看。上游是否有 FT 测试，没有核实。
 - 嵌套 STW 只读了源码。上游 STW 期间的属性访问在实际模型上是否执行字节码，没有验证。

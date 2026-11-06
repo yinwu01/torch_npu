@@ -4,7 +4,7 @@
 
 - 代码：`yinwu01/torch_npu`，分支 `fix/profiler-thread-safety`。
 - 基线：`113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
-- 修复提交：`663e8ba`（主体），`f36d74d`（异常路径的引用泄漏）。
+- 修复提交：`663e8ba`（主体），`f36d74d`（异常路径的引用泄漏），`1ece90d`（候选 1：3.13 及以上用 `PyMapping_GetItemString` 读 `self`）。
 - 术语见 [README.md](README.md) 的“术语”一节。
 
 ## 1. 结论
@@ -16,7 +16,7 @@
 | 找到的问题 | 上报链路中有 3 处线程安全问题。对应文件与基线 `46936d1`（TorchNPU 2.13.0）逐字节相同，所以问题不是 r22 分支引入的。 |
 | 为什么 FT 下才暴露 | 有 GIL 时，多个 Python 线程基本依次执行，问题很少暴露。FT 构建下多个线程同时执行，问题就会暴露。 |
 | 修改内容 | 4 个源文件，加一套压力测试。 |
-| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`（torch 2.13.0、CPython 3.14t、CANN toolkit 9.1.0），`npu_check.py` 各次运行都正常退出（[progress.md](progress.md) 2026-11-06）。 |
+| 验证结果 | stub 环境中，原代码 42 次场景运行全部失败，其中有 SIGSEGV。修复后 42 次全部通过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`（torch 2.13.0、CPython 3.14t、CANN toolkit 9.1.0），`npu_check.py` 的三次运行都正常退出：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`（[progress.md](progress.md) 2026-11-06）。 |
 | 未完成的验证 | 问题 1、2、3 的修改只在 stub 的 C++ 单元测试中专门测试过。NPU 上的运行没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。GIL 构建只做了编译检查。 |
 
 测试的调用比 `ProfilerMgr` 的实际调用更密集，例如两个线程并发调用 `Stop`。所以原代码失败只说明这些路径有竞态。它不能说明使用方的崩溃来自哪一处。
@@ -383,7 +383,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 7. 接手后的步骤
 
-1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处，并补上 `b2e659d62f`。
+1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处。候选 1 已在 NPU 上确认，候选 2、3 结论待定。`b2e659d62f` 的 `PyMapping_GetItemString` 和判空部分已在本分支 `1ece90d` 补上，11-06 在 NPU 上重测，不再崩溃。
 2. 决定合入方式：
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master。上游这两处逻辑与 2.13.0 相同，但做过 clang-format。补丁不能直接 `git apply`，要手工合入。这些修改没有在 master 上编译过。
    - 问题 3 建议以上游 `ff5ad88d8a` 为基础，并补四处修改。理由和修改内容见 [analysis.md](analysis.md) 第 7.3 节。
