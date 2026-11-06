@@ -287,11 +287,11 @@ GIL 构建中外部可观察的行为不变（推断，没有运行验证）。�
 
 涉及文件：`profiler/profiler_python.cpp`。与线程无关，单线程、有 GIL 时同样成立。背景见 [analysis.md](analysis.md) 第 4.2 节。
 
-- 原代码用 `PyDict_GetItemString` 读 `nn.Module` 帧和 `Optimizer` 帧的 `self`。3.13 起 `f_locals` 不是 `dict`，这个调用返回空指针，随后对空指针取属性而崩溃。CPython C API 的行为已验证。
+- 原代码用 `PyDict_GetItemString` 读 `nn.Module` 帧和 `Optimizer` 帧的 `self`。`f_locals` 不是 `dict` 时，这个调用返回空指针，随后对空指针取属性而崩溃。3.14.3 和 3.14.3t 上返回 NULL（已验证）。3.13 依据 PEP 667（推断）。
 - 3.13 及以上改用 `PyMapping_GetItemString`。返回的新引用用 `THPObjectPtr` 持有。3.13 以下保留 `PyDict_GetItemString`。
 - 取不到 `self` 时，清除错误并跳过这条记录。
 - 理由：`pyProfileFn` 没有 try/catch，C++ 异常不能从回调抛出。上游 master 在这里抛异常。出处：`1ece90d` 提交信息。
-- 验证：11-03 在 NPU 上复现了 torch_npu 的崩溃（`2148353`）。11-06 在 3.14.3t 上、在 NPU 上重测，不再崩溃；修改前的对照构建仍崩溃。
+- 验证：11-03 在 NPU 上复现了 torch_npu 的崩溃（`2148353`）。11-06 在 3.14.3t 上、在 NPU 上重测，不再崩溃；修改前的对照构建仍崩溃。对照构建的基线提交未知，与 `9f34a2a` 的其他差异没有核对（[progress.md](progress.md) 2026-11-06：在 NPU 上重测候选 1 的修改）。
 
 ## 4. 验证
 
@@ -347,7 +347,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 - stub 与真实 CPython 3.14 不完全一致。真实的 `PyEval_SetProfile` 会触发审计回调。`ModuleInfo`、`parseModuleParams` 调用的 CPython 接口在 stub 中从不报错，所以测试不覆盖它们抛 Python 异常的路径。
 - GIL 路径只编译，不运行。
-- stub 只编译 3.13 以下的分支，`1ece90d` 的 3.13 及以上分支只有 NPU 运行覆盖。
+- stub 只编译 3.13 以下的分支。`1ece90d` 的 3.13 及以上分支只在 NPU 上用 3.14.3t 运行过 `nn.Module` 路径；3.13 和 Optimizer 路径没有运行。
 - `ProfilerMgr` 没有编译进测试。
 - 测试检出回归的能力有限。变异测试每项 25 次运行：去掉 `WaitWriters` 失败 2 次；去掉 `Report` 中的二次检查失败 1 次；恢复原来的 `Run` 循环失败 0 次；把 `seq_cst` 改弱失败 0 次。完整列表见 [learning.md](learning.md) A4.3。
 
@@ -365,7 +365,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 | 可用容量从 capacity-1 变为 capacity。非 2 的幂的容量向上取整。 | 新队列的写法 |
 | 采集运行中调用 `Init`：记一条错误日志，先停止并把数据写完到旧路径，再按新路径初始化。原代码直接在运行中的缓冲区上重新分配。 | 避免在写入方访问时重新分配缓冲区 |
 | `UnInit` 遇到仍在运行的上报器时，先停止并写完数据。 | 析构路径同样需要安全 |
-| 3.13 及以上，取不到 `nn.Module` 或 `Optimizer` 帧的 `self` 时跳过该记录。原代码对 NULL 取属性而崩溃。 | 候选 1 |
+| 取不到 `nn.Module` 或 `Optimizer` 帧的 `self` 时跳过该记录（所有版本）。原代码对 NULL 取属性而崩溃。 | 候选 1 |
 
 ### 5.2 只影响 FT 构建
 
@@ -399,7 +399,7 @@ python3 test/cpp/profiler_thread_safety/run.py --source-root /tmp/orig --builds 
 
 ## 7. 接手后的步骤
 
-1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处。候选 1 的崩溃路径已在 NPU 上复现（单线程、`--stack`），是否为使用方崩溃的原因，结论待定。候选 2、3 结论待定。本分支 `1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 4 步的修改做法”后的警告），11-06 重测不再崩溃。
+1. 按 [analysis.md](analysis.md) 第 7.1 节确认崩溃出在哪一处。候选 1 的崩溃路径已在 NPU 上复现（单线程、`--stack`），是否为使用方崩溃的原因，结论待定。候选 2、3 结论待定。本分支 `1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 3 步的修改做法（与 `1ece90d` 相同）”后的警告），11-06 重测不再崩溃。
 2. 决定合入方式：
    - 问题 1、2 的修改（`ring_buffer.h`、`data_dumper.h/.cpp`）可以移植到上游 master。上游这两处逻辑与 2.13.0 相同，但做过 clang-format。补丁不能直接 `git apply`，要手工合入。这些修改没有在 master 上编译过。
    - 问题 3 建议以上游 `ff5ad88d8a` 为基础，并补四处修改。理由和修改内容见 [analysis.md](analysis.md) 第 7.3 节。

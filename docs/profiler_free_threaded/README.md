@@ -31,7 +31,7 @@
 
 1. 向使用方要 profiler 配置、是否多线程和崩溃时机。
 2. 在原构建上运行单线程最小脚本（`npu_check.py --stack`，见“文件”一节），用 gdb 栈顶检查候选 1。
-3. 在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 4 步的修改做法”后的警告）。单线程含停止采集，检查候选 1、2；多线程重复运行，检查候选 3。
+3. 在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 3 步的修改做法（与 `1ece90d` 相同）”后的警告）。单线程含停止采集，检查候选 1、2；多线程重复运行，检查候选 3。
 4. 本分支已补同一处修改（`1ece90d`）。用第 3.2 步的用例运行。只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认修复。
 
 > [!WARNING]
@@ -125,4 +125,4 @@ NPU 检查脚本：[`test/profiler_free_threaded/npu_check.py`](../../test/profi
 
 ## 交付状态
 
-代码经过三轮审阅，文档经过多轮审阅，全部由 AI 模型子代理完成，没有人工审阅。改写（`ee31dbb`）后经过两轮独立审阅。按第二轮意见做的修订（`2148353`）和之后的提交（`d2a3f84` 至 `4f5bff0`）未经审阅。代码的三轮审阅只覆盖 `663e8ba`、`f36d74d`。经过见 [progress.md](progress.md)。
+代码经过三轮审阅，文档经过多轮审阅，全部由 AI 模型子代理完成，没有人工审阅。改写（`ee31dbb`）后经过两轮独立审阅，修改在 `757b3f7`、`2148353`。之后 11-05 一轮审阅覆盖到 `4f5bff0`，26 条意见，修改在 `99d5500`、`f1eb4d3`；再一轮覆盖到 `f1eb4d3`，11 条意见，修改在 `f1eb4d3` 之后的提交（提交信息 “docs(profiler): apply review round 2; record the --export db round”）。这些修改和之后的提交未经审阅。代码的三轮审阅只覆盖 `663e8ba`、`f36d74d`。经过见 [progress.md](progress.md)。

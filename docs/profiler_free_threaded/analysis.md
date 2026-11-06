@@ -222,7 +222,7 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 |---|---|
 | 3.14.3t 上 `PyObject_GetAttrString(NULL, "__class__")` 以 SIGSEGV 退出（退出码 139）。输出只记录了 `exit=139`，没有记录 `sys.version` 和 `Py_GIL_DISABLED`，所以“在 3.14.3t 上”无法从日志核对。重新运行时记录这两项。 | 已验证 |
 | pybind11 的 `handle(nullptr).attr` 调用这个函数 | 推断 |
-| 3.14.3t（FT）单线程开 `--stack` 时，第一次 `nn.Module` 调用崩溃 | 已验证（NPU，11-03） |
+| `2148353` 单线程开 `--stack` 时 SIGSEGV，栈 `ModuleInfo::ModuleInfo → PyObject_GetAttrString` | 已验证（NPU，11-03；11-03 的 Python 版本没有记录） |
 | 3.13 和 GIL 构建同样崩溃 | 推断，依据 PEP 667 |
 | 3.13 及以上，开启 `with_stack` 或 `with_modules`，且 `record_params_` 为真时（`profile_memory` 且 `record_shapes`），Optimizer 分支对 NULL 调用 `parseOptimizerParams` | 推断 |
 | `ff5ad88d8a` 保留 `PyMapping_GetItemString`，取不到时抛 `KeyError`；去掉“3.12 及以上跳过 `Py_DECREF`”，改由 `releaseContext()` 持 GIL 释放共享 ctx | 已验证 |
@@ -288,18 +288,18 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 上游 | 同线程重入时死锁：`start()` 持锁执行 `captureStartFrames`，用户代码可能再调用 `startOne/stopOne` | 已验证（第 5.3 节）。实际出现的可能性很低（推断） |
 | 上游 | 回调持有 `callback_mutex_` 时调用 `stop/startOne`，与 `stop()` 互相等待 | 未验证 |
 | 上游 | STW 期间执行 Python 对象操作（取类名、读 `_parameters`、`param_groups`、`state.get`）。如果执行了字节码且有待执行的垃圾回收，会嵌套请求 STW 并死锁 | 推断 |
-| 上游 | 依赖 `_PyEval_StopTheWorld`，CPython 升级时可能失效 | 3.14.3 已导出；以后版本未验证 |
-| 上游 | GIL 构建行为变化（第 4.4 节） | 读代码，没有运行 |
-| 上游 | 3.13t 只告警，仍有读其他线程栈的竞态 | 读代码 |
-| 上游 | FT 构建每个事件取一次全局 `results_mutex_` | 读代码；stub 吞吐见第 5.4 节 |
+| 上游 | 依赖 `_PyEval_StopTheWorld`，CPython 升级时可能失效 | 未验证（3.14.3 导出这两个函数，已验证；以后版本没有核实） |
+| 上游 | GIL 构建行为变化（第 4.4 节） | 推断（读代码，没有运行） |
+| 上游 | 3.13t 只告警，仍有读其他线程栈的竞态 | 推断（读代码） |
+| 上游 | FT 构建每个事件取一次全局 `results_mutex_` | 已验证（读代码；stub 吞吐见第 5.4 节） |
 | 上游 | 等 `results_mutex_` 时不 detach。以后在持有它时引入 Python 调用或 STW 会死锁 | 推断 |
-| 本分支 | 曾缺少 `PyMapping_GetItemString` 修改。`1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 4 步的修改做法”后的警告） | 已验证。NPU 上的运行：11-03 不含这处修改的 `2148353` 以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 含 `1ece90d` 的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃 |
-| 本分支 | 读 `c_profilefunc`、`c_profileobj`，布局可能随小版本变化 | 读代码 |
-| 本分支 | FT 下每次调用至少两次全局 `data_mutex_` | 第 5.4 节 |
-| 本分支 | `session_` 逻辑复杂；两轮 stop/start 期间漏采一个线程 | 代码注释已写明 |
+| 本分支 | 曾缺少 `PyMapping_GetItemString` 修改。`1ece90d` 已补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 3 步的修改做法（与 `1ece90d` 相同）”后的警告） | 已验证。NPU 上的运行：11-03 不含这处修改的 `2148353` 以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 含 `1ece90d` 的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃。对照构建的基线提交未知，与 `9f34a2a` 的其他差异没有核对（[progress.md](progress.md) 2026-11-06：在 NPU 上重测候选 1 的修改） |
+| 本分支 | 读 `c_profilefunc`、`c_profileobj`，布局可能随小版本变化 | 已验证（读代码；布局不属于稳定接口，第 4.4 节） |
+| 本分支 | FT 下每次调用至少两次全局 `data_mutex_` | 已验证（读代码；stub 吞吐见第 5.4 节） |
+| 本分支 | `session_` 逻辑复杂；两轮 stop/start 期间漏采一个线程 | 推断（读代码，代码注释已写明） |
 | 本分支 | 与上游结构不同，以后同步要手工合并 | 已验证 |
-| 本分支 | 锁只在 FT 构建生效，GIL 构建依赖 GIL。GIL 构建只编译，没有运行 | [fix_details.md](fix_details.md) 第 4.4、5.2 节 |
-| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；本分支 `9f34a2a` 在 NPU 上运行过 `npu_check.py`，没有专门测试这一行为 | 读代码 |
+| 本分支 | 锁只在 FT 构建生效，GIL 构建依赖 GIL。GIL 构建只编译，没有运行 | 已验证（[fix_details.md](fix_details.md) 第 4.4、5.2 节） |
+| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；本分支 `9f34a2a` 在 NPU 上运行过 `npu_check.py`，没有专门测试这一行为 | 推断（读代码，没有专门测试） |
 
 嵌套 STW 的依据（读 CPython v3.14.3 源码，没有运行）：`stop_the_world()` 先执行 `PyMutex_Lock(&stw->mutex)`（`pystate.c` 2372 行），不可重入。FT 的垃圾回收调用 `_PyEval_StopTheWorld`（`gc_free_threading.c` 2185 行），由 `_Py_ScheduleGC` 推迟到线程处理待办事件时执行（2152 行）。`sys._current_frames()` 也在 STW 期间读帧（推断）。“STW 期间执行字节码”没有找到先例。
 
@@ -437,7 +437,7 @@ flowchart TD
     S2 --> D2{"第一次前向时崩溃，栈顶在 PyObject_GetAttrString，往上是 ModuleInfo::ModuleInfo？"}
     D2 -->|是| C1P["对应候选 1，待第 3.1 步确认"]
     D2 -->|否| S3
-    C1P --> S3["第 3 步：原构建只补 b2e659d62f 的 PyMapping_GetItemString 和判空部分"]
+    C1P --> S3["第 3 步：原构建只补 b2e659d62f 的 PyMapping_GetItemString 改法，另加判空"]
     S3 --> S31["第 3.1 步：单线程，含停止采集，PYTHONMALLOC=debug，gdb"]
     S31 --> D31{"第 3.1 步的结果，下列各项可以同时成立"}
     D31 -->|"第 2 步前向崩溃，这里不再崩溃"| C1["确认候选 1"]
@@ -466,7 +466,7 @@ flowchart TD
    - 如果第一次前向时崩溃，且 `bt` 的栈顶在 `PyObject_GetAttrString`、往上是 `ModuleInfo::ModuleInfo`，对应候选 1。
    - 只看到前向崩溃，不足以区分候选 1 和候选 3 中的问题 2。单个 Python 线程时仍有 C++ 写入方。
    - 候选 1 成立时，进程执行不到停止采集，所以这一步看不到候选 2。
-3. **在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 4 步的修改做法”后的警告）。** 重新编译，然后：
+3. **在原构建上只补 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`b2e659d62f` 没有判空，见第 7.1 节“第 3 步的修改做法（与 `1ece90d` 相同）”后的警告）。** 重新编译，然后：
    1. 在 gdb 下重新运行单线程脚本，包含停止采集（`prof.stop()` 或退出 `with` 块），开启 `PYTHONMALLOC=debug`。
       - 如果第 2 步在前向时崩溃、这里不再崩溃，确认候选 1。
       - 如果停止采集时终止，且栈顶往上是 `PythonTracer::clear` 或 `~ThreadLocalResult`，或者报 `_PyMem_DebugFree` 错误，对应候选 2。
@@ -480,12 +480,12 @@ flowchart TD
    - 另外覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置，确认能正常导出结果。
    - 不含 `1ece90d` 的构建会先遇到候选 1：11-03 在 NPU 上，`2148353` 开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
 
-**第 4 步的修改做法：**
+**第 3 步的修改做法（与 `1ece90d` 相同）：**
 
 - 3.13 以下保留 `PyDict_GetItemString`。3.13 及以上用 `PyMapping_GetItemString`。
 - 用 `THPObjectPtr` 持有返回的新引用。`PyDict_GetItemString` 返回借用引用，只替换函数名会造成引用泄漏。
 - 取不到 `self` 时判空跳过。上游 `ff5ad88d8a` 的做法是抛 `KeyError`，由回调的 `catch (...)` 处理。
-- 3.13 及以上 `PyDict_GetItemString` 必定返回 NULL（第 4.2 节，已验证）。所以这处修改不取决于第 2、3 步的结果，作为独立提交。
+- 3.14.3 和 3.14.3t 上 `PyDict_GetItemString` 返回 NULL（第 4.2 节，已验证）。3.13 依据 PEP 667（推断）。所以这处修改不取决于第 2、3 步的结果，本分支已作为独立提交 `1ece90d`。
 
 > [!WARNING]
 > 不要整个 cherry-pick `b2e659d62f`。它在 `~ThreadLocalResult` 中用 `#if ... PY_MINOR_VERSION < 12` 跳过 `Py_DECREF(ctx_)`（注释原文 "purposefully allowing for a small leak"）。本分支的 `clear()` 已改为持有 GIL 释放 ctx，所以不要移植这一部分。`b2e659d62f` 也没有对 `self` 判空。
@@ -497,7 +497,7 @@ flowchart TD
 | `PYTHONFAULTHANDLER=1` 或 `-X faulthandler` | SIGSEGV 时打印 Python 层调用栈，用来看崩溃在前向中还是停止采集时。GIL 构建打印所有线程。FT 构建只打印崩溃线程，并输出 `<Cannot show all threads while the GIL is disabled>`。 | 已验证（3.14.3、3.14.3t，输出经 `head -12` 截断） |
 | `PYTHONMALLOC=debug` | 未 attach 时调用 `PyObject_Free`，FT 构建以 `Fatal Python error: _PyMem_DebugFree: Python memory allocator called without an active thread state` 终止，GIL 构建提示 `called without holding the GIL`。不设时不报错。 | 已验证（同上） |
 | `PYTHONMALLOC=debug` 对候选 2 | 候选 2 经 `Py_DECREF` 释放，开启后在释放处终止，与 issue #5658 的描述一致。它对经 glibc malloc 分配的候选 3 无效，候选 3 用 ASan 构建。 | 推断 |
-| gdb `bt` | 取得 C++ 调用栈，读法见下表 | 无 |
+| gdb `bt` | 取得 C++ 调用栈，读法见下表 | 未验证（本文没有记录 gdb 的运行；下表的读法为推断） |
 
 | 栈顶位置 | 对应 |
 |---|---|
@@ -535,7 +535,7 @@ flowchart TD
 - 使用方的崩溃出在哪一处，没有确定（第 1.5、7.1 节）。
 - 11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN toolkit 9.1.0 编译了 `9f34a2a`（含 `663e8ba`、`f36d74d`、`1ece90d`），在 NPU 上运行了三次 `npu_check.py`：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`。三次退出码都是 0（[progress.md](progress.md) 2026-11-06）。`npu_check.py` 在 `profile()` 内才启动 worker 线程，`nn.Module` 只在 worker 线程里调用；这些线程可能不被采集（推断），所以 4 线程运行不作为候选 1 修复的证据。11-03 不含修复的 `2148353` 跑 4 线程开 `--stack` 到第 14 次没有崩溃，和推断相符。
 - 三处线程安全修改只在 stub 的 C++ 单元测试中专门测试过。GIL 构建只做了编译检查。
-- 第 4.2 节的路径在 NPU 上用 torch_npu 运行过：11-03 `2148353`（不含 `1ece90d`）开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 重测了 `1ece90d` 的修改：含它的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃（[progress.md](progress.md) 2026-11-06）。`npu_check.py` 不调用 Optimizer，也不开 `profile_memory` 和 `record_shapes`，所以 Optimizer 分支没有在 NPU 上运行。
+- 第 4.2 节的路径在 NPU 上用 torch_npu 运行过：11-03 `2148353`（不含 `1ece90d`）开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 重测了 `1ece90d` 的修改：含它的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃。对照构建的基线提交未知，与 `9f34a2a` 的其他差异没有核对（[progress.md](progress.md) 2026-11-06：在 NPU 上重测候选 1 的修改）。`npu_check.py` 不调用 Optimizer，也不开 `profile_memory` 和 `record_shapes`，所以 Optimizer 分支没有在 NPU 上运行。
 - 开始采集后启动的线程是否被采集，结论待定。
 - 崩溃路径 `PythonTraceback::gather`：出处已丢失（测试方找不到 `WORK_REPORT.md`），原因未查明。
 - 上游 PR 的验证截图没有查看。上游是否有 FT 测试，没有核实。

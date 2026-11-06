@@ -1,6 +1,6 @@
 # 进展记录
 
-代码修改、测试和文档已完成。候选 1 的崩溃路径已在 NPU 上复现，它的修改已在 NPU 上重测。候选 1 是否为使用方崩溃的原因，结论待定。含全部代码修改的 `9f34a2a` 已用 FT 版环境编译，并在 NPU 上运行。候选 2、3 的确认、GIL 版编译、问题 1、2、3 的修改在 NPU 上的专门测试是待办。
+代码修改、stub 测试和文档已完成。候选 1 的崩溃路径已在 NPU 上复现，它的修改已在 NPU 上重测。候选 1 是否为使用方崩溃的原因，结论待定。含全部代码修改的 `9f34a2a` 已用 FT 版环境编译，并在 NPU 上运行。待办：向使用方要配置，在原构建上检查候选 1，确认候选 2、3，GIL 版编译，问题 1、2、3 的修改在 NPU 上的专门测试，手动运行 msprof 导出。
 
 - 对象：分支 `fix/profiler-thread-safety`，基线 `113xiaoji/torch_npu` 的 `codex/r22-real-four-worker-20261027`（`d3216c2`，TorchNPU 2.13.0）。
 - 提交时间来自 `git log`，时区 `-0800`。
@@ -26,7 +26,7 @@
 | 与上游 `ff5ad88d8a` 的对照，用本仓库测试运行上游版本 | 已完成 | 无 |
 | 文档目录 | 已完成 | 发现错误时按本文记录 |
 | 向使用方要配置和崩溃时机 | 待办 | [analysis.md](analysis.md) 第 7.1 节第 1 步 |
-| 在 NPU 上复现候选 1 的崩溃路径（单线程、`--stack`）；在本分支补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`1ece90d`；`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 4 步的修改做法”后的警告），在 NPU 上重测 | 已完成 | 无 |
+| 在 NPU 上复现候选 1 的崩溃路径（单线程、`--stack`）；在本分支补上 `b2e659d62f` 的 `PyMapping_GetItemString` 改法，另加判空（`1ece90d`；`b2e659d62f` 没有判空，见 [analysis.md](analysis.md) 第 7.1 节“第 3 步的修改做法（与 `1ece90d` 相同）”后的警告），在 NPU 上重测 | 已完成 | 无 |
 | 在原构建上检查候选 1（[analysis.md](analysis.md) 第 7.1 节第 2 步） | 待办 | 11-03 在 `2148353` 上复现了崩溃路径，没有在原构建上复现。11-06 的对照构建没有调试符号。用有调试符号的原构建在 gdb 下运行 |
 | 候选 1 是否为使用方崩溃的原因 | 待办 | 结论待定。先做 [analysis.md](analysis.md) 第 7.1 节第 1 步 |
 | 确认候选 2、3 | 待办 | [analysis.md](analysis.md) 第 7.1 节第 3–4 步 |
@@ -35,7 +35,8 @@
 | FT 版编译：用真实 torch、CPython 3.14t、CANN 头文件编译 `9f34a2a` | 已完成 | 无 |
 | GIL 版编译：用真实 torch、CPython 3.14、CANN 头文件编译 | 待办 | 与 FT 版分别编译 |
 | 在 NPU 上运行 `npu_check.py`（`9f34a2a`，三次：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`） | 已完成 | 无 |
-| `npu_check.py --export db` 一轮 | 待办 | 检查 `CANNTimelineParser` 是否不再报 run failed |
+| `npu_check.py --export db` 一轮 | 已完成 | 无 |
+| 手动运行 msprof 导出，查看输出和日志 | 待办 | 运行 `msprof --export=on`，text 和 `--type=db` 各一次（进展 2026-11-06：`npu_check.py --export text` 和 `--export db`） |
 | 在 NPU 上专门测试问题 1、2、3 的修改 | 待办 | 多线程推理开 profiler，覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup；运行 `test/profiler/` 确认 GIL 版行为不变 |
 | 问题 3 的合入方式 | 待办 | 由接手的工程师或上游维护者决定。建议以上游为基础（[analysis.md](analysis.md) 第 7.3 节） |
 | host regions 的 worker 线程算子可能采集不到 | 待办 | 核实 worker 的数量和创建时机 |
@@ -46,6 +47,21 @@
 | 两轮 stop/start 期间漏采一个线程 | 待办 | 已写进代码注释。改用上游方案后不存在 |
 
 ## 进展
+
+### 2026-11-06：`npu_check.py --export text` 和 `--export db`
+
+- 结果由 NPU 测试方提供。
+- 构建：torch_npu `2.13.0+git9f34a2a`。检查脚本为 `090c9ef` 版的 `npu_check.py`，上传到容器中运行。
+
+| 命令 | 退出码 | run failed 条数 | 产物 |
+|---|---|---|---|
+| `--export text` | 0 | 9 | `ASCEND_PROFILER_OUTPUT` 下有 `analyse.done`、`trace_view.json`（152032 字节）；`msprof_*.db` 0 个 |
+| `--export db` | 0 | 3（`CANNTimelineParser`、`CANNAnalyzeParser`、`DbParser`） | `analyse.done`；没有 `trace_view.json`；`msprof_*.db` 0 个 |
+| `--stack --export text` | 0 | 9 | `analyse.done`、`trace_view.json`（859573 字节）；`msprof_*.db` 0 个 |
+| `--stack --export db` | 0 | 3 | `analyse.done`；`msprof_*.db` 0 个 |
+
+- 结论：两种导出格式都没有让解析走通。db 模式下 msprof 也没有生成 `msprof_*.db`。
+- 下一步（待办）：手动运行 `msprof --export=on`，text 和 `--type=db` 各一次，查看 msprof 自己的输出和日志。
 
 ### 2026-11-06：在 NPU 上重测候选 1 的修改
 
@@ -63,17 +79,23 @@
   - C 栈顶函数（`PyObject_GetAttrString`）与 11-03 相同。没有调试符号，`ModuleInfo::ModuleInfo` 这一层无法核对。
 - 结论：在这个环境中，含 `1ece90d` 的构建不再出现候选 1 的崩溃路径。是否为使用方崩溃的原因，结论待定。
 - 归因：对照构建不含本分支任何代码提交（`663e8ba`、`f36d74d`、`1ece90d`）。它的基线提交未知，所以它与 `9f34a2a` 的其他差异没有核对。归因到 `1ece90d` 还依据 11-03 的运行：含 `663e8ba`、`f36d74d` 但不含 `1ece90d` 的 `2148353` 同样崩溃在 `PyObject_GetAttrString`。
-- 注：对照构建是 10-28 的修改前构建，与 11-03 使用的 `2148353` 不完全相同。
+- 注：对照构建是 10-28 的修改前构建。`2148353` 含 `663e8ba`、`f36d74d`，对照构建不含。
 - 未解决：
   - 4 线程运行不能说明 worker 线程被采集。开始采集后启动的线程可能不被采集（推断）。
   - 崩溃路径 `PythonTraceback::gather`：出处已丢失（测试方找不到 `WORK_REPORT.md`），原因未查明。
-- 与本分支修改无关的现象：本分支构建的每次运行都输出 9 条解析任务 "run failed"（`CANNTimelineParser` 和依赖它的 8 个任务）。msprof 日志为 "Current scene of data is based on single_op" 和 "There is no summary data to export"，没有导出 `mindstudio_profiler_output/*.csv`。`CANNTimelineParser` 等待这些 csv；只剩 NON_BLOCKING 任务时，任务管理器按设计停止。修改后的构建上开或不开 `--stack` 都出现。修改前的构建只运行了开 `--stack` 的一次，在解析前崩溃；不开 `--stack` 没有运行，所以修改前的构建上是否出现，无法判断。这是 CANN 一侧的行为，不在本分支范围内。db 导出的测试待办。
+- 与本分支修改无关的现象：本分支构建的每次运行都输出 9 条解析任务 "run failed"（`CANNTimelineParser` 和依赖它的 8 个任务）。msprof 日志为 "Current scene of data is based on single_op" 和 "There is no summary data to export"，没有导出 `mindstudio_profiler_output/*.csv`。`CANNTimelineParser` 等待这些 csv；只剩 NON_BLOCKING 任务时，任务管理器按设计停止。修改后的构建上开或不开 `--stack` 都出现。修改前的构建只运行了开 `--stack` 的一次，在解析前崩溃；不开 `--stack` 没有运行，所以修改前的构建上是否出现，无法判断。这是 CANN 一侧的行为，不在本分支范围内。`--export db` 的结果：3 条 run failed（`CANNTimelineParser`、`CANNAnalyzeParser`、`DbParser`），没有生成 `msprof_*.db`，见“2026-11-06：`npu_check.py --export text` 和 `--export db`”。
+
+### 2026-11-05：两轮文档审阅
+
+- 一轮覆盖到 `4f5bff0`，26 条意见，修改在 `99d5500`、`f1eb4d3`。
+- 再一轮覆盖到 `f1eb4d3`，11 条意见，修改在 `f1eb4d3` 之后的提交（提交信息 “docs(profiler): apply review round 2; record the --export db round”）。
+- 这些修改和之后的提交未经审阅。
 
 ### 2026-11-03：在 NPU 上运行 `2148353`
 
 - 结果由 NPU 测试方提供。
 - 检查脚本 `test/profiler_free_threaded/npu_check.py` 由 `d2a3f84`（03:10）加入。
-- 构建：`2148353`。它含 `663e8ba`、`f36d74d`，不含 `1ece90d`。它不是 [analysis.md](analysis.md) 第 7.1 节定义的原构建。
+- 构建：`2148353`。它含 `663e8ba`、`f36d74d`，不含 `1ece90d`。它不是 [README.md](README.md) 术语表定义的原构建。
   - 单线程开 `--stack`：SIGSEGV。栈：`pyProfileFn → recordPyCall → genPyCallHashId → ModuleInfo::ModuleInfo → PyObject_GetAttrString`。
   - 单线程不开 `--stack`：退出码 0。
   - 4 线程 × 20 次，不开 `--stack`：退出码 0。
@@ -85,7 +107,7 @@
 - 五个文件按 ASD-STE100 的写法规则改写：短句、编号步骤、术语统一、警告单独成块，加 6 张 Mermaid 图。
 - 审阅过程和本机路径移出正文，本机日志的来源列在 [analysis.md](analysis.md) 附录。
 - 改写已提交为 `ee31dbb`。
-- 改写后经过两轮独立审阅。按第二轮意见做的修订（`2148353`）和之后的提交（`d2a3f84` 至 `4f5bff0`）未经审阅。代码的三轮审阅只覆盖 `663e8ba`、`f36d74d`。
+- 改写后经过两轮独立审阅，修改在 `757b3f7`、`2148353`。
 
 ### 2026-11-02：整理后的五轮文档审阅
 
@@ -125,6 +147,6 @@
 ## 交付状态
 
 - 问题 1、2、3 的修改（`663e8ba`、`f36d74d`）只在 stub 的 C++ 单元测试中专门测试过。11-06 在 NPU 上编译并运行了含全部代码修改的 `9f34a2a`，`npu_check.py` 的三次运行（单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`）都正常退出，但没有专门触发这三处问题。修改前这三处问题在 NPU 上是否导致崩溃，结论待定。
-- 11-03 NPU 结果：`npu_check.py --stack` 单线程 SIGSEGV（退出码 139），栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`，复现了候选 1 的崩溃路径。不开 `with_stack` 的单线程和 4 线程 20 次都正常退出（出处：11-03 测试方结果，单线程和 4 线程 × 20 次都不开 `--stack`，退出码 0）。4 线程开 `with_stack` 跑到第 14/20 次时磁盘满，没有崩溃（`1ece90d` 提交信息写的是第 13 次）。
+- 11-03 NPU 结果：`npu_check.py --stack` 单线程 SIGSEGV，栈顶 `ModuleInfo::ModuleInfo → PyObject_GetAttrString`，复现了候选 1 的崩溃路径。不开 `with_stack` 的单线程和 4 线程 20 次都正常退出（出处：11-03 测试方结果，单线程和 4 线程 × 20 次都不开 `--stack`，退出码 0）。4 线程开 `with_stack` 跑到第 14/20 次时磁盘满，没有崩溃（`1ece90d` 提交信息写的是第 13 次）。
 - 候选 1 的修改在 `1ece90d`。11-06 NPU 重测：`9f34a2a` 上单线程开 `--stack` 正常退出；修改前的构建在同一环境中 SIGSEGV。4 线程运行可能没有采集 worker 线程（推断），不作为候选 1 修复的证据。候选 1 是否为使用方崩溃的原因，结论待定。候选 2、3 是否也会导致崩溃，结论待定。
-- 审阅：代码三轮，每轮两位审阅者，只覆盖 `663e8ba`、`f36d74d`；原交接文档两轮；整理后五个文件五轮；改写（`ee31dbb`）后两轮。按第二轮意见做的修订（`2148353`）和之后的提交（`d2a3f84` 至 `4f5bff0`）未经审阅。所有审阅和修复都由 AI 模型子代理完成，没有人工审阅。
+- 审阅：代码三轮，每轮两位审阅者，只覆盖 `663e8ba`、`f36d74d`；原交接文档两轮；整理后五个文件五轮；改写（`ee31dbb`）后两轮，修改在 `757b3f7`、`2148353`；11-05 一轮覆盖到 `4f5bff0`，26 条意见，修改在 `99d5500`、`f1eb4d3`；再一轮覆盖到 `f1eb4d3`，11 条意见，修改在 `f1eb4d3` 之后的提交（提交信息 “docs(profiler): apply review round 2; record the --export db round”）。这些修改和之后的提交未经审阅。所有审阅和修复都由 AI 模型子代理完成，没有人工审阅。
