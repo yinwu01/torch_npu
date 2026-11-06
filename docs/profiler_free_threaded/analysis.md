@@ -292,13 +292,13 @@ ModuleInfo module_info(module_class);   // 构造函数里执行 py::handle(modu
 | 上游 | 3.13t 只告警，仍有读其他线程栈的竞态 | 读代码 |
 | 上游 | FT 构建每个事件取一次全局 `results_mutex_` | 读代码；stub 吞吐见第 5.4 节 |
 | 上游 | 等 `results_mutex_` 时不 detach。以后在持有它时引入 Python 调用或 STW 会死锁 | 推断 |
-| 本分支 | 缺少 `PyMapping_GetItemString` 修改 | C API 行为已验证；torch_npu 未验证 |
+| 本分支 | 曾缺少 `PyMapping_GetItemString` 修改，`1ece90d` 已补上 `b2e659d62f` 中 `PyMapping_GetItemString` 和判空的部分 | 已验证（NPU）：11-03 不含这处修改的 `2148353` 以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 含 `1ece90d` 的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃 |
 | 本分支 | 读 `c_profilefunc`、`c_profileobj`，布局可能随小版本变化 | 读代码 |
 | 本分支 | FT 下每次调用至少两次全局 `data_mutex_` | 第 5.4 节 |
 | 本分支 | `session_` 逻辑复杂；两轮 stop/start 期间漏采一个线程 | 代码注释已写明 |
 | 本分支 | 与上游结构不同，以后同步要手工合并 | 已验证 |
 | 本分支 | 锁只在 FT 构建生效，GIL 构建依赖 GIL。GIL 构建只编译，没有运行 | [fix_details.md](fix_details.md) 第 4.4、5.2 节 |
-| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；上游没有在 NPU 上运行；本分支 `9f34a2a` 在 NPU 上运行过 `npu_check.py`，没有专门测试这一行为 | 读代码 |
+| 两者 | FT 下 `stop()` 清除所有线程的 profile 函数；stub 与真实 CPython 不一致；本分支 `9f34a2a` 在 NPU 上运行过 `npu_check.py`，没有专门测试这一行为 | 读代码 |
 
 嵌套 STW 的依据（读 CPython v3.14.3 源码，没有运行）：`stop_the_world()` 先执行 `PyMutex_Lock(&stw->mutex)`（`pystate.c` 2372 行），不可重入。FT 的垃圾回收调用 `_PyEval_StopTheWorld`（`gc_free_threading.c` 2185 行），由 `_Py_ScheduleGC` 推迟到线程处理待办事件时执行（2152 行）。`sys._current_frames()` 也在 STW 期间读帧（推断）。“STW 期间执行字节码”没有找到先例。
 
@@ -477,7 +477,7 @@ flowchart TD
 4. **在本分支上补同一处修改，作为独立提交。** 编译本分支。用第 3.2 步的同一组用例、同样的重复次数运行。
    - 只有第 3.2 步复现了崩溃、这里不再崩溃，才算确认本分支的修复。
    - 另外覆盖 `with_stack=True`、`profile_memory=True`、`schedule` 带 warmup 这几种配置，确认能正常导出结果。
-   - 本分支同样缺少 `b2e659d62f`。如果不补，会先遇到候选 1。
+   - 本分支已在 `1ece90d` 补上这处修改。不含它的构建会先遇到候选 1：11-03 在 NPU 上，`2148353` 开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`。
 
 **第 4 步的修改做法：**
 
@@ -533,8 +533,8 @@ flowchart TD
 
 - 使用方的崩溃出在哪一处，没有确定（第 1.5、7.1 节）。
 - 11-06 用真实 torch 2.13.0、CPython 3.14.3t、CANN toolkit 9.1.0 编译了 `9f34a2a`（含 `663e8ba`、`f36d74d`、`1ece90d`），在 NPU 上运行了三次 `npu_check.py`：单线程开 `--stack`；4 线程 × 20 次开 `--stack`；单线程不开 `--stack`。三次退出码都是 0（[progress.md](progress.md) 2026-11-06）。
-- 三处线程安全修改只在 stub 的 C++ 单元测试中专门测试过。GIL 构建只做了编译检查。上游版本没有在真实环境中编译和运行。
-- 第 4.2 节只验证了 C API 行为，没有运行 torch_npu。
+- 三处线程安全修改只在 stub 的 C++ 单元测试中专门测试过。GIL 构建只做了编译检查。
+- 第 4.2 节的路径在 NPU 上用 torch_npu 运行过：11-03 `2148353`（不含 `1ece90d`）开 `--stack` 时以 SIGSEGV 退出，栈顶 `PyObject_GetAttrString`，往上是 `ModuleInfo::ModuleInfo`；11-06 重测了 `1ece90d` 的修改：含它的 `9f34a2a` 没有崩溃，同一环境中修改前的构建（10-28）仍然崩溃（[progress.md](progress.md) 2026-11-06）。`npu_check.py` 不调用 Optimizer，也不开 `profile_memory` 和 `record_shapes`，所以 Optimizer 分支没有在 NPU 上运行。
 - 上游 PR 的验证截图没有查看。上游是否有 FT 测试，没有核实。
 - 嵌套 STW 只读了源码。上游 STW 期间的属性访问在实际模型上是否执行字节码，没有验证。
 - 上游 `init.cpp` 的 GIL 处理只依据 `6ca3a36a15` 的 PR 描述：GIL 释放移到绑定处，用 `py::call_guard<py::gil_scoped_release>()`。按此描述，上游 tracer 的 `start/stop/clear` 仍在已释放 GIL 的线程上调用。`init.cpp` 没有查看。
