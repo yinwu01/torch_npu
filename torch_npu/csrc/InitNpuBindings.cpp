@@ -1,49 +1,54 @@
-#include <Python.h>
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
+#include <Python.h>
 #include <c10/util/SmallVector.h>
 #include <torch/csrc/Dtype.h>
+#include <mutex>
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/Generator.h>
 #include <torch/csrc/autograd/python_variable.h>
 #include <torch/csrc/profiler/python/combined_traceback.h>
 
 #include "torch_npu/csrc/aten/common/TensorFactories.h"
-#include "torch_npu/csrc/npu/Event.h"
-#include "torch_npu/csrc/npu/DataParallelComm.h"
+#include "torch_npu/csrc/core/npu/CachingHostAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUSwappedMemoryAllocator.h"
-#include "torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h"
 #include "torch_npu/csrc/core/npu/npu_log.h"
-#include "torch_npu/csrc/core/npu/CachingHostAllocator.h"
+#include "torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h"
 #include "torch_npu/csrc/inductor/aoti_package/shape_handling.h"
+#include "torch_npu/csrc/npu/DataParallelComm.h"
+#include "torch_npu/csrc/npu/Event.h"
 #ifndef BUILD_LIBTORCH
 #include "torch_npu/_inductor/experimental/python_wrapper_fast_launch/csrc/bindings.h"
 #include "torch_npu/csrc/inductor/static_launcher/bindings.h"
 #endif
-#include "torch_npu/csrc/distributed/Init.h"
 #include "torch_npu/csrc/afd/Init.h"
-#include "torch_npu/csrc/profiler/init.h"
-#include "torch_npu/csrc/flopcount/Init.h"
-#include "torch_npu/csrc/logging/Init.h"
-#include "torch_npu/csrc/ipc/StorageSharing.h"
-#include "torch_npu/csrc/npu/Module.h"
-#include "torch_npu/csrc/npu/npurt.h"
-#include "torch_npu/csrc/custom_dtype/Init.h"
-#include "torch_npu/csrc/npu/Stress_detect.h"
-#include "torch_npu/csrc/utils/TensorType.h"
-#include "torch_npu/csrc/utils/PythonGilAdapter.h"
-#include "torch_npu/csrc/utils/PythonOomAdapter.h"
-#include "torch_npu/csrc/utils/AutocastMode.h"
-#include "torch_npu/csrc/core/npu/NPURecoveryBindings.h"
 #include "torch_npu/csrc/core/npu/NPUFunctions.h"
 #include "torch_npu/csrc/core/npu/NPUInterruptAffinity.h"
+#include "torch_npu/csrc/core/npu/NPURecoveryBindings.h"
+#include "torch_npu/csrc/custom_dtype/Init.h"
+#include "torch_npu/csrc/distributed/Init.h"
+#include "torch_npu/csrc/flopcount/Init.h"
+#include "torch_npu/csrc/ipc/StorageSharing.h"
+#include "torch_npu/csrc/logging/Init.h"
+#include "torch_npu/csrc/npu/Module.h"
+#include "torch_npu/csrc/npu/Stress_detect.h"
+#include "torch_npu/csrc/npu/npurt.h"
+#include "torch_npu/csrc/profiler/init.h"
 #include "torch_npu/csrc/profiler/python/combined_traceback.h"
+#include "torch_npu/csrc/utils/AutocastMode.h"
+#include "torch_npu/csrc/utils/PythonGilAdapter.h"
+#include "torch_npu/csrc/utils/PythonOomAdapter.h"
+#include "torch_npu/csrc/utils/TensorType.h"
 #ifndef BUILD_LIBTORCH
 #include "torch_npu/csrc/sanitizer/NPUTrace.h"
 #endif
 
 PyObject* module;
+
+namespace {
+std::mutex npu_shutdown_mutex;
+}
 
 void AddPyMethodDefs(std::vector<PyMethodDef>& vector, PyMethodDef* methods) {
   if (!vector.empty()) {
@@ -60,6 +65,7 @@ void AddPyMethodDefs(std::vector<PyMethodDef>& vector, PyMethodDef* methods) {
 }
 
 PyObject* THPModule_npu_shutdown(PyObject* self, PyObject* arg) {
+  std::lock_guard<std::mutex> shutdown_lock(npu_shutdown_mutex);
   if (!PyBool_Check(arg)) {
     PyErr_SetString(PyExc_TypeError, "Expected a boolean value");
     return NULL;
@@ -118,6 +124,7 @@ PyObject* THPModule_npu_shutdown(PyObject* self, PyObject* arg) {
 }
 
 PyObject* THPModule_npu_shutdown_synchronize(PyObject* /* unused */) {
+  std::lock_guard<std::mutex> shutdown_lock(npu_shutdown_mutex);
   ASCEND_LOGI("NPU shutdown synchronize begin.");
   if (!c10_npu::NpuSysCtrl::GetInstance().GetInitFlag()) {
     Py_RETURN_FALSE;
@@ -280,5 +287,28 @@ extern "C"
 }
 
 PyMODINIT_FUNC PyInit__C(void) {
-  return initModule();
+  PyObject* result = initModule();
+  if (result == nullptr) {
+    return nullptr;
+  }
+
+#if defined(TORCH_NPU_EXPERIMENTAL_FREE_THREADED) && TORCH_NPU_EXPERIMENTAL_FREE_THREADED
+  constexpr int capability = 1;
+#else
+  constexpr int capability = 0;
+#endif
+  if (PyModule_AddIntConstant(result, "_experimental_free_threaded_build", capability) < 0) {
+    Py_DECREF(result);
+    module = nullptr;
+    return nullptr;
+  }
+
+#if defined(Py_GIL_DISABLED) && defined(TORCH_NPU_EXPERIMENTAL_FREE_THREADED) && TORCH_NPU_EXPERIMENTAL_FREE_THREADED
+  if (PyUnstable_Module_SetGIL(result, Py_MOD_GIL_NOT_USED) < 0) {
+    Py_DECREF(result);
+    module = nullptr;
+    return nullptr;
+  }
+#endif
+  return result;
 }

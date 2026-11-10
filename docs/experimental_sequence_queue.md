@@ -7,20 +7,44 @@ This branch starts at Ascend/pytorch master commit
 `d538cb535626c2ba8e26541dfbd19f3cc85e4d10`. It keeps upstream's Python
 tracer unchanged, including its per-thread caches and callback shutdown.
 
-Only the profiler RingBuffer, DataDumper and TraceDataDumper fixes are
-ported from `fix/profiler-thread-safety` at
-`82831f4486e7c5973b5b895cf5ff6690410dcaaf`. The old Python tracer changes
-and the fork's host-region extensions are not part of this branch.
+The profiler RingBuffer, DataDumper and TraceDataDumper fixes are ported from
+`fix/profiler-thread-safety` at `82831f4486e7c5973b5b895cf5ff6690410dcaaf`.
+The old Python tracer changes are not ported. The branch additionally ports
+113xiaoji's drain/free-threaded baseline `7d45a86cd1fdf70d8177445f0c79268cc75c7516`
+and host regions `d3216c2359a1753ec05a95f6ed0517f92677238f`.
 
-The PR adapter is adjusted for current upstream: GIL waits use PythonGilBridge,
-and the release worker starts lazily for aclop tasks. If worker creation fails,
-parameter release falls back to the upstream synchronous path. The queue core
-and its standalone tests remain identical to the PR.
+The host-region-aware NPUQueue adapter selects the ordered core by default or
+the PR's sequence core when explicitly enabled. It replaces the PR's separate
+NPUQueueSequence adapter so prefix tracking, ownership retirement and batch
+interfaces are available in either build. Captured packets still require the
+ordered batch queue: they are rejected when the sequence option is ON.
+GIL waits use PythonGilBridge and worker joins restore the attached state on
+exceptions. The release worker retains current upstream's lazy aclop startup
+and synchronous fallback if worker creation fails. The Python GIL adapter uses
+the actual attached thread state instead of assuming a GIL exists.
+The sequence core and its standalone tests remain identical to the PR; the
+ordered core retains the fork's batch API and drain-only wake optimization.
 
-Source comparisons and whitespace/conflict checks are the only validation
-performed on the Windows integration host. C++ compilation, sanitizer runs,
-and Linux/NPU validation are pending. No earlier branch's test results qualify
-this new combination. Keep the experimental option OFF until it is validated.
+Windows validation passed: 42 host-region Python lifecycle/provider tests,
+9 overlay-tool safety tests, 17 compiled sequence-core scenarios, the compiled
+ordered-core correctness suite, and all 3 compiled drain/lifecycle contracts.
+The contracts confirmed zero repeated nonempty drain wakes and no early drain
+returns. Python syntax, conflict/whitespace checks and source comparisons passed.
+These are host tests; Linux adapter compilation, profiler upload stress tests,
+sanitizers and NPU validation remain pending. Historical source pins and device
+measurements in experimental_free_threaded describe the old snapshots, not this
+combined branch. All experimental options remain OFF by default.
+
+The included op-plugin overlay is historical and still requires base commit
+`312921458e7d396c54a1e92e90385d7d5f02dede`. This branch keeps the current
+upstream submodule pin `eee88cf400f796c150db5a6203c4218b5af7ea18`; the overlay
+tool must reject it rather than overwrite newer code. Real op-plugin-backed
+host-region execution requires rebasing and validating that overlay separately.
+Without its adapter headers, the native capability reports unavailable and
+rejects real owned-OpAPI capture; ordinary builds use explicit fallback symbol
+definitions instead of depending on missing overlay symbols.
+The host-region implementation and tests are included, but this is not a claim
+that the experimental device path is ready for use on the new submodule.
 
 The upload-path regression tests compile the actual ring buffer, dumper and
 Linux Thread implementation, with stubs only for reporting and file/log helpers.

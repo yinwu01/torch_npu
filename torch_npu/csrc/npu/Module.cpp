@@ -1,12 +1,13 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <linux/limits.h>
 #include <sstream>
 #include <sys/stat.h>
 #include <thread>
 #include <unordered_map>
-#include <algorithm>
 
 #include <ATen/ATen.h>
 #include <ATen/CachedTensorUtils.h>
@@ -16,6 +17,7 @@
 #include <torch/csrc/autograd/generated/VariableType.h>
 #include <torch/csrc/autograd/generated/variable_factories.h>
 #include <torch/csrc/autograd/utils/wrap_outputs.h>
+#include <torch/csrc/inductor/aoti_runner/pybind.h>
 #include <torch/csrc/profiler/python/combined_traceback.h>
 #include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/pybind.h>
@@ -23,11 +25,10 @@
 #include <torch/csrc/utils/python_numbers.h>
 #include <torch/csrc/utils/python_strings.h>
 #include <torch/csrc/utils/tensor_numpy.h>
-#include <torch/csrc/inductor/aoti_runner/pybind.h>
 #include <torch_npu/csrc/inductor/aoti_runner/pybind.h>
 
-#include <op_plugin/utils/custom_functions/opapi/FFTCommonOpApi.h>
 #include <acl/acl.h>
+#include <op_plugin/utils/custom_functions/opapi/FFTCommonOpApi.h>
 #include <third_party/fmt/include/fmt/format.h>
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 #include <torch_npu/csrc/aten/NPUNativeFunctions.h>
@@ -50,7 +51,6 @@
 #include <torch_npu/csrc/core/npu/NpuVariables.h>
 #include <torch_npu/csrc/core/npu/interface/AclInterface.h>
 #include <torch_npu/csrc/core/npu/interface/OpInterface.h>
-#include <torch_npu/csrc/npu/NpuSleep.h>
 #include <torch_npu/csrc/core/npu/register/OptionRegister.h>
 #include <torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h>
 #include <torch_npu/csrc/framework/StorageDescHelper.h>
@@ -61,12 +61,18 @@
 #include <torch_npu/csrc/npu/Module.h>
 #include <torch_npu/csrc/npu/NPUPluggableAllocator.h>
 #include <torch_npu/csrc/npu/NPURecovery.h>
+#include <torch_npu/csrc/npu/NpuSleep.h>
 #include <torch_npu/csrc/npu/Stream.h>
 #include <torch_npu/csrc/npu/Stress_detect.h>
 #include <torch_npu/csrc/npu/memory_snapshot.h>
 #include <torch_npu/csrc/profiler/combined_traceback.h>
 #include <torch_npu/csrc/profiler/python/combined_traceback.h>
 #include <torch_npu/csrc/utils/LazyInit.h>
+
+namespace c10_npu::prefix {
+C10_NPU_API std::function<void()> MakeDefaultStreamPrefixWaiter();
+C10_NPU_API std::function<void()> MakeDefaultStreamPrefixH2DWaiter();
+} // namespace c10_npu::prefix
 
 constexpr int32_t kDeviceUtilizationNotSupport = -1;
 
@@ -266,7 +272,8 @@ void initDeviceProperty(int64_t deviceid) {
       TORCH_NPU_WARN_ONCE(
           "AclrtGetDeviceInfo failed to get ubuf size, error code is ",
           acl_ret,
-          ". The attribute may not be supported by this CANN/driver combination.");
+          ". The attribute may not be supported by this CANN/driver "
+          "combination.");
     }
   }
 
@@ -539,8 +546,10 @@ void RegisterNpuPluggableAllocator(PyObject* module) {
         if (c10_npu::option::OptionsManager::CheckForceUncached()) {
           TORCH_CHECK(
               false,
-              "checkpoint do not support enabling PYTORCH_NO_NPU_MEMORY_CACHING, "
-              "Use torch_npu._C._npu_setCheckpointPoolState, ensure PYTORCH_NO_NPU_MEMORY_CACHING is disabled",
+              "checkpoint do not support enabling "
+              "PYTORCH_NO_NPU_MEMORY_CACHING, "
+              "Use torch_npu._C._npu_setCheckpointPoolState, ensure "
+              "PYTORCH_NO_NPU_MEMORY_CACHING is disabled",
               PTA_ERROR(ErrCode::PARAM));
         }
         auto delta = c10_npu::NPUCachingAllocator::setCheckpointPoolState(device, std::move(pps));
@@ -707,6 +716,38 @@ static PyObject* THNPModule_initExtension(PyObject* self, PyObject* noargs) {
   END_HANDLE_TH_ERRORS
 }
 
+PyObject* THNPModule_prefixCompletionFactory(PyObject* _unused, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+  std::function<void()> completion;
+  {
+    pybind11::gil_scoped_release no_gil;
+    completion = c10_npu::prefix::MakeDefaultStreamPrefixWaiter();
+  }
+  return pybind11::cpp_function([completion = std::move(completion)] {
+           pybind11::gil_scoped_release no_gil;
+           completion();
+         })
+      .release()
+      .ptr();
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject* THNPModule_prefixH2DCompletionFactory(PyObject* _unused, PyObject* noargs) {
+  HANDLE_TH_ERRORS
+  std::function<void()> completion;
+  {
+    pybind11::gil_scoped_release no_gil;
+    completion = c10_npu::prefix::MakeDefaultStreamPrefixH2DWaiter();
+  }
+  return pybind11::cpp_function([completion = std::move(completion)] {
+           pybind11::gil_scoped_release no_gil;
+           completion();
+         })
+      .release()
+      .ptr();
+  END_HANDLE_TH_ERRORS
+}
+
 PyObject* THNPModule_npuSynchronize(PyObject* _unused, PyObject* noargs) {
   HANDLE_TH_ERRORS
   pybind11::gil_scoped_release no_gil;
@@ -834,8 +875,9 @@ PyObject* THNPModule_restart_device_wrap(PyObject* self, PyObject* arg) {
     TORCH_NPU_RECOVERY_LOGI(
         "get_device_error_info device is %d, errorType is %d.", error_info.device, error_info.info.errorType);
     if (error_info.is_valid && error_info.info.tryRepair) {
-      // UCE memory errors must use the address list filtered by checkUceInMemPool,
-      // otherwise detail.uceInfo may contain addresses already released by emptyCache.
+      // UCE memory errors must use the address list filtered by
+      // checkUceInMemPool, otherwise detail.uceInfo may contain addresses
+      // already released by emptyCache.
       if (error_info.info.errorType == ACL_RT_ERROR_MEMORY) {
         auto memUceInfo_ = c10_npu::get_mem_uce_info();
         if (memUceInfo_.retSize > 0) {
@@ -845,7 +887,8 @@ PyObject* THNPModule_restart_device_wrap(PyObject* self, PyObject* arg) {
             error_info.info.detail.uceInfo.memUceInfoArray[i] = memUceInfo_.info[i];
           }
           TORCH_NPU_RECOVERY_LOGI(
-              "NPU repair error with filtered uce, device is %d, retSize is %d, copy_size is %d.",
+              "NPU repair error with filtered uce, device "
+              "is %d, retSize is %d, copy_size is %d.",
               error_info.device,
               memUceInfo_.retSize,
               copy_size);
@@ -1748,7 +1791,8 @@ PyObject* THNPModule_getOption_wrap(PyObject* self, PyObject* option_type) {
 PyObject* THNPModule_npu_set_sync_debug_mode(PyObject* _unused, PyObject* arg) {
   HANDLE_TH_ERRORS
   TORCH_NPU_WARN_ONCE(
-      "Synchronization debug mode is a prototype feature and does not yet detect all "
+      "Synchronization debug mode is a prototype feature and "
+      "does not yet detect all "
       "synchronizing operations");
   TORCH_CHECK(
       THPUtils_checkLong(arg),
@@ -1978,7 +2022,8 @@ PyObject* THNPModule_npu_set_thread_affinity(PyObject* self, PyObject* args) {
 
   TORCH_CHECK(
       false,
-      "Invalid arguments for _npu_set_thread_affinity. Expected either two integers (core_start, core_end) or a list of integers",
+      "Invalid arguments for _npu_set_thread_affinity. Expected either "
+      "two integers (core_start, core_end) or a list of integers",
       PTA_ERROR(ErrCode::PARAM));
 
   END_HANDLE_TH_ERRORS
@@ -2285,6 +2330,8 @@ static struct PyMethodDef THNPModule_methods[] = {
      (PyCFunction)THNPModule_set_run_yet_variable_to_false_wrap,
      METH_NOARGS,
      nullptr},
+    {"_npu_prefix_h2d_completion_factory", (PyCFunction)THNPModule_prefixH2DCompletionFactory, METH_NOARGS, nullptr},
+    {"_npu_prefix_completion_factory", (PyCFunction)THNPModule_prefixCompletionFactory, METH_NOARGS, nullptr},
     {"_npu_synchronize", (PyCFunction)THNPModule_npuSynchronize, METH_NOARGS, nullptr},
     {"_npu_setDevice", (PyCFunction)THNPModule_setDevice_wrap, METH_O, nullptr},
     {"_npu_set_op_timeout_ms", (PyCFunction)THNPModule_setOpTimeoutMs, METH_O, nullptr},

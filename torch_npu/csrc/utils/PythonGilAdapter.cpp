@@ -6,7 +6,11 @@
 namespace torch_npu::utils {
 namespace {
 void* releaseIfHeld() {
-  return PyGILState_Check() ? PyEval_SaveThread() : nullptr;
+#if PY_VERSION_HEX >= 0x030D0000
+  return PyThreadState_GetUnchecked() != nullptr ? PyEval_SaveThread() : nullptr;
+#else
+  return _PyThreadState_UncheckedGet() != nullptr ? PyEval_SaveThread() : nullptr;
+#endif
 }
 
 void restore(void* state) {
@@ -14,14 +18,12 @@ void restore(void* state) {
 }
 
 void runWithGilReleased(c10::function_ref<void()> fn) {
-  PyThreadState* state = nullptr;
-  if (PyGILState_Check()) {
-    state = PyEval_SaveThread();
-  }
+  // Restore on exceptions too; callbacks may report an ACL error by throwing.
+  struct RestoreState {
+    void* state = releaseIfHeld();
+    ~RestoreState() { if (state != nullptr) restore(state); }
+  } saved;
   fn();
-  if (state != nullptr) {
-    PyEval_RestoreThread(state);
-  }
 }
 
 const c10_npu::impl::PythonGilHooks hooks{releaseIfHeld, restore, runWithGilReleased};

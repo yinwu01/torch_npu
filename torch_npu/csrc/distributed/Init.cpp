@@ -1,33 +1,34 @@
 #include <deque>
 
-#include <torch/custom_class.h>
-#include <torch/csrc/python_headers.h>
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/irange.h>
 #include <c10d/ProcessGroup.hpp>
-#include <c10d/comm.hpp>
 #include <c10d/Work.hpp>
+#include <c10d/comm.hpp>
 #include <pybind11/chrono.h>
+#include <torch/csrc/python_headers.h>
+#include <torch/custom_class.h>
 
-#include <torch/csrc/Exceptions.h>
 #include <ATen/core/functional.h>
+#include <torch/csrc/Exceptions.h>
+#include <torch/csrc/distributed/c10d/python_comm_hook.h>
 #include <torch/csrc/jit/python/pybind_utils.h>
 #include <torch/csrc/utils/object_ptr.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/csrc/utils/tensor_flatten.h>
-#include <torch/csrc/distributed/c10d/python_comm_hook.h>
 
-#include "torch_npu/csrc/distributed/rpc/init.h"
-#include "torch_npu/csrc/distributed/ProcessGroupHCCL.hpp"
-#include "torch_npu/csrc/distributed/ProcessGroupLCCL.hpp"
-#include "torch_npu/csrc/distributed/reducer.hpp"
-#include "torch_npu/csrc/distributed/ParallelTcpStore.hpp"
-#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
 #include "torch_npu/csrc/aten/CustomFunctions.h"
+#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
 #include "torch_npu/csrc/core/NPUBridge.h"
 #include "torch_npu/csrc/core/npu/MemPool.h"
 #include "torch_npu/csrc/distributed/Init.h"
+#include "torch_npu/csrc/distributed/ParallelTcpStore.hpp"
+#include "torch_npu/csrc/distributed/ProcessGroupHCCL.hpp"
+#include "torch_npu/csrc/distributed/ProcessGroupLCCL.hpp"
 #include "torch_npu/csrc/distributed/PythonDebugAdapter.h"
+#include "torch_npu/csrc/distributed/reducer.hpp"
+#include "torch_npu/csrc/distributed/rpc/init.h"
+#include "torch_npu/csrc/utils/PythonThreadState.h"
 
 namespace {
 
@@ -46,12 +47,10 @@ class IntrusivePtrNoGilDestructor {
   explicit IntrusivePtrNoGilDestructor(T* impl) : impl_(c10::intrusive_ptr<T>::unsafe_steal_from_new(impl)) {}
   ~IntrusivePtrNoGilDestructor() {
     if (impl_) {
-      if (PyGILState_Check() != 0) {
-        pybind11::gil_scoped_release release;
-        impl_.reset();
-      } else {
-        impl_.reset();
-      }
+#ifndef BUILD_LIBTORCH
+      torch_npu::utils::PythonThreadStateDetachGuard detach_guard;
+#endif
+      impl_.reset();
     }
   }
   T& operator*() const noexcept {
@@ -576,8 +575,9 @@ Example::
       [](std::optional<bool> includeCollectives,
          std::optional<bool> includeStackTraces,
          std::optional<bool> onlyActive) {
-        return py::bytes(::c10d_npu::dump_hccl_trace(
-            includeCollectives.value_or(true), includeStackTraces.value_or(true), onlyActive.value_or(false)));
+        return py::bytes(
+            ::c10d_npu::dump_hccl_trace(
+                includeCollectives.value_or(true), includeStackTraces.value_or(true), onlyActive.value_or(false)));
       },
       py::arg("includeCollectives") = std::optional<bool>(),
       py::arg("includeStackTraces") = std::optional<bool>(),
@@ -596,7 +596,8 @@ Example::
 }
 
 // c10d methods on torch._C
-static PyMethodDef methods[] = { // NOLINT
+static PyMethodDef methods[] = {
+    // NOLINT
     {"_c10d_npu_init", c10d_npu_init, METH_NOARGS, nullptr},
 #ifdef USE_RPC_FRAMEWORK
     {"_rpc_npu_init", rpc::rpc_npu_init, METH_NOARGS, nullptr},

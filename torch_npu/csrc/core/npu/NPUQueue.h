@@ -1,40 +1,42 @@
-#if defined(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE)
-#include "torch_npu/csrc/core/npu/NPUQueueSequence.h"
-#else
 #pragma once
 
 #include <string>
+#include <cstddef>
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
 
 #include <c10/core/Device.h>
 #include "torch_npu/csrc/logging/LogContext.h"
+#ifdef TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE
+#include "torch_npu/csrc/core/npu/ExperimentalSequenceMpscQueueCore.h"
+#else
+#include "torch_npu/csrc/core/npu/OrderedMpscQueueCore.h"
+#endif
 #include <acl/acl_op.h>
 
 namespace c10_npu {
 
-inline std::shared_ptr<npu_logging::Logger>& GetQueueLogger() {
-  static std::shared_ptr<npu_logging::Logger> logger = npu_logging::logging().getLogger("torch_npu.dispatch");
-  return logger;
+inline std::shared_ptr<npu_logging::Logger>& GetQueueLogger()
+{
+    static std::shared_ptr<npu_logging::Logger> logger = npu_logging::logging().getLogger("torch_npu.dispatch");
+    return logger;
 }
 
-#define TORCH_NPU_QUEUE_LOGD(format, ...)                             \
-  do {                                                                \
-    TORCH_NPU_LOGD(c10_npu::GetQueueLogger(), format, ##__VA_ARGS__); \
-    ASCEND_LOGD(format, ##__VA_ARGS__);                               \
-  } while (0);
+#define TORCH_NPU_QUEUE_LOGD(format, ...)                                      \
+    do {                                                                       \
+        TORCH_NPU_LOGD(c10_npu::GetQueueLogger(), format, ##__VA_ARGS__);      \
+        ASCEND_LOGD(format, ##__VA_ARGS__);                                    \
+    } while (0);
 
-#define TORCH_NPU_QUEUE_LOGI(format, ...)                             \
-  do {                                                                \
-    TORCH_NPU_LOGI(c10_npu::GetQueueLogger(), format, ##__VA_ARGS__); \
-    ASCEND_LOGI(format, ##__VA_ARGS__);                               \
-  } while (0);
-
-struct sring_idx {
-  bool working = false;
-  volatile unsigned int idx = 0;
-};
+#define TORCH_NPU_QUEUE_LOGI(format, ...)                                      \
+    do {                                                                       \
+        TORCH_NPU_LOGI(c10_npu::GetQueueLogger(), format, ##__VA_ARGS__);      \
+        ASCEND_LOGI(format, ##__VA_ARGS__);                                    \
+    } while (0);
 
 enum RepoStatus {
   INIT = 0,
@@ -51,15 +53,35 @@ enum RepoStatus {
   SUSPECT_REMOTE_EXIT = 11,
 };
 
+enum class Lifecycle {
+  Uninitialized,
+  Initializing,
+  Running,
+  Stopping,
+  Stopped,
+};
+
+struct ErrorRecord {
+  std::string repository;
+  std::string acl;
+  std::string queue;
+  std::string current_parameter;
+};
+
+struct NativeQueueBatchSnapshot {
+  uint64_t fast_calls = 0;
+  uint64_t committed_bursts = 0;
+  uint64_t committed_items = 0;
+  uint64_t fallback_calls = 0;
+};
+
+NativeQueueBatchSnapshot GetNativeQueueBatchSnapshot() noexcept;
+
 // c10::SmallVector max size
 const int N = 32;
-// When task queue is empty, poll the read queue for at most 1ms till more tasks
-// sent in. In terms of time granularity, executing query
-// function--IsEmptyQueue() for 200000 times is equal to 1ms.
-const int READ_QUEUE_POLL_MAX_LOOP = 200000;
 
 class ReleaseQueue {
- public:
+public:
   ReleaseQueue() = default;
   ~ReleaseQueue();
   void PushToReleaseQueue(void* cur_paras);
@@ -67,43 +89,37 @@ class ReleaseQueue {
   void InitReleaseQueue(c10::DeviceIndex device_id);
   bool StartReleaseThreadIfNeeded();
   bool IsReleaseThreadRunning() const;
+  void Shutdown();
+  void WaitForEligibleOwners();
   RepoStatus GetStatus() const;
   c10::DeviceIndex GetDeviceID() const;
 
- private:
-  enum class WorkerStatus {
-    NOT_STARTED = 0,
-    RUNNING = 1,
-    DISABLED = 2,
-    STOPPING = 3,
-    STOPPED = 4,
-  };
-
-  inline bool IsEmptyQueue() {
-    return read_idx.idx == write_idx.idx;
-  };
-  bool IsFullQueue() const;
-  bool WriteToReleaseQueue(void* cur_paras);
-  bool ReadFromReleaseQueue();
+private:
+  friend void StartRelease(ReleaseQueue* releaseQue);
   void SetStatus(RepoStatus desired);
   void ChangeStatus(RepoStatus expected, RepoStatus desired);
 
- private:
+private:
   void* data = nullptr;
   std::thread releaser;
   c10::DeviceIndex device_idx;
 
- private:
-  sring_idx read_idx;
-  sring_idx write_idx;
-  std::atomic<RepoStatus> repo_status;
-  std::atomic<WorkerStatus> worker_status{WorkerStatus::NOT_STARTED};
-  std::mutex release_thread_mutex;
-  bool buffer_initialized = false;
+private:
+  #ifdef TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE
+  using QueueCore = queue::ExperimentalSequenceMpscQueueCore;
+#else
+  using QueueCore = queue::OrderedMpscQueueCore;
+#endif
+  QueueCore queue_core_{8192};
+  std::atomic<RepoStatus> repo_status{RepoStatus::INIT};
+  std::atomic<Lifecycle> lifecycle_{Lifecycle::Uninitialized};
+  std::mutex lifecycle_mu_;
+  std::atomic<bool> worker_running_{false};
+  bool worker_start_disabled_ = false;
 };
 
 class NPUQueueBase {
- public:
+public:
   virtual ~NPUQueueBase() {}
   virtual RepoStatus GetStatus() const = 0;
   virtual void SetStatus(RepoStatus desired) = 0;
@@ -121,102 +137,82 @@ class NPUQueueBase {
 };
 
 class NPUQueueFactoryBase {
- public:
+public:
   virtual NPUQueueBase* create() = 0;
   virtual ~NPUQueueFactoryBase() {}
 };
 
 class Repository : public NPUQueueBase {
- public:
+public:
   Repository() = default;
   ~Repository() override;
   RepoStatus GetStatus() const override;
   void SetStatus(RepoStatus desired) override;
   void ChangeStatus(RepoStatus expected, RepoStatus desired) override;
   void Enqueue(void* cur_paras) override;
+  void EnqueueBatch(void* const* items, size_t count,
+    void (*prepare)(size_t, void*), void* context);
   void Dequeue() override;
   NPUStatus MakeSureQueueEmpty(bool check_error = true) override;
   void InitRepo(c10::DeviceIndex device_id) override;
   bool CheckInit() const override;
   std::string GetPara() override;
   void ClearQueue() override;
-  void SetQueueErrMsg(const char* errmsg) override;
+  void SetQueueErrMsg(const char *errmsg) override;
   std::string GetQueueErrMsg() override;
-  bool IsEmptyRepo() override {
-    return IsEmptyQueue();
-  }
+  bool IsEmptyRepo() override { return queue_core_.Snapshot().size == 0; }
 
- private:
+private:
   void ReleaseResource();
-  inline bool IsEmptyQueue() {
-    return read_idx.idx == write_idx.idx;
-  };
-  bool IsFullQueue() const;
-  void SetWriteWorking(bool isWorking) {
-    write_idx.working = isWorking;
-  };
-  void SetReadWorking(bool isWorking) {
-    read_idx.working = isWorking;
-  };
-  bool IsWriteWorking() const {
-    return write_idx.working;
-  };
-  bool IsReadWorking() const {
-    return read_idx.working;
-  };
-  bool WriteQueue(void* cur_paras);
   bool ReadQueue();
   void CheckDeviceError(int ret, std::string& err_msg);
   void ThrowDeviceError(RepoStatus current_status, void* cur_paras);
+  ErrorRecord SnapshotError() const;
+  void RecordRepositoryError(std::string message);
+  void RecordAclError(std::string message);
+  void RecordCurrentParameter(std::string message);
 
- private:
+private:
   void* data = nullptr;
   std::thread consumer;
-  int efd_read;
-  int efd_write;
-  int efd_empty;
   c10::DeviceIndex device_idx;
-  std::string error_msg;
 
- private:
-  sring_idx read_idx;
-  sring_idx write_idx;
-  std::atomic<RepoStatus> repo_status;
-  bool need_empty = false;
-  bool initialized = false;
-  std::mutex mu_empty;
-  // In theory, this is not necessary.
-  // The logic is ensured by original pytorch, but this is added here just in
-  // case.
-  std::mutex mu_enqueue;
+private:
+  #ifdef TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE
+  using QueueCore = queue::ExperimentalSequenceMpscQueueCore;
+#else
+  using QueueCore = queue::OrderedMpscQueueCore;
+#endif
+  QueueCore queue_core_{4096};
+  std::atomic<RepoStatus> repo_status{RepoStatus::INIT};
+  std::atomic<Lifecycle> lifecycle_{Lifecycle::Uninitialized};
+  std::mutex lifecycle_mu_;
+  std::condition_variable lifecycle_cv_;
+  uint64_t status_epoch_ = 0;
+  mutable std::mutex error_mu_;
+  ErrorRecord error_;
   ReleaseQueue releaseQueue;
 };
 
-using ACL_EXEC_FUNC = std::function<int(void*)>;
-using ACL_COPY_FUNC = std::function<void(void*, void*)>;
-using ACL_RELEASE_FUNC = std::function<void(void*, ReleaseQueue&)>;
-using ACL_NEW_FUNC = std::function<void*(int, int&)>;
-using ACL_DELETE_FUNC = std::function<void(void*)>;
+using ACL_EXEC_FUNC     = std::function<int(void*)>;
+using ACL_COPY_FUNC     = std::function<void(void*, void*)>;
+using ACL_RELEASE_FUNC  = std::function<void(void*, ReleaseQueue&)>;
+using ACL_NEW_FUNC      = std::function<void*(int, int&)>;
+using ACL_DELETE_FUNC   = std::function<void(void*)>;
 using ACL_COPY_RELEASE_PARM_FUNC = std::function<void(void*, void*)>;
 using ACL_RELEASE_PARAM_FUNC = std::function<void(void*)>;
 
 namespace register_queue_cb {
 class NPUCallBackRegisterBuilder {
- public:
-  NPUCallBackRegisterBuilder(
-      const ACL_EXEC_FUNC& execF,
-      const ACL_COPY_FUNC& copyF,
-      const ACL_RELEASE_FUNC& releaseF,
-      const ACL_NEW_FUNC& newF,
-      const ACL_DELETE_FUNC& deleteF,
-      const ACL_COPY_RELEASE_PARM_FUNC& copyReleaseParamF,
-      const ACL_RELEASE_PARAM_FUNC& releaseParamF);
+public:
+  NPUCallBackRegisterBuilder(const ACL_EXEC_FUNC& execF, const ACL_COPY_FUNC& copyF,
+    const ACL_RELEASE_FUNC& releaseF, const ACL_NEW_FUNC& newF, const ACL_DELETE_FUNC& deleteF,
+    const ACL_COPY_RELEASE_PARM_FUNC& copyReleaseParamF, const ACL_RELEASE_PARAM_FUNC& releaseParamF);
   ~NPUCallBackRegisterBuilder() {}
 };
 } // namespace register_queue_cb
 
-#define REGISTER_QUEUE_FUNC(execF, copyF, releaseF, newF, deleteF, copyReleaseParamF, releaseParamF) \
-  static ::c10_npu::register_queue_cb::NPUCallBackRegisterBuilder register_queue_func_builder(       \
-      execF, copyF, releaseF, newF, deleteF, copyReleaseParamF, releaseParamF);
+#define REGISTER_QUEUE_FUNC(execF, copyF, releaseF, newF, deleteF, copyReleaseParamF, releaseParamF)  \
+    static ::c10_npu::register_queue_cb::NPUCallBackRegisterBuilder                     \
+        register_queue_func_builder(execF, copyF, releaseF, newF, deleteF, copyReleaseParamF, releaseParamF);
 } // namespace c10_npu
-#endif // TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE

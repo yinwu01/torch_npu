@@ -2,16 +2,16 @@
 #include <c10/core/thread_pool.h>
 #include <future>
 
-#include <c10/core/DeviceGuard.h>
-#include <c10/util/llvmMathExtras.h>
-#include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "torch_npu/csrc/core/npu/npu_log.h"
-#include <c10/util/Logging.h>
-#include "torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h"
-#include "torch_npu/csrc/core/npu/interface/AsyncTaskQueueInterface.h"
-#include "torch_npu/csrc/core/npu/interface/AclInterface.h"
-#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
 #include "torch_npu/csrc/core/npu/NPUFunctions.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/interface/AclInterface.h"
+#include "torch_npu/csrc/core/npu/interface/AsyncTaskQueueInterface.h"
+#include "torch_npu/csrc/core/npu/npu_log.h"
+#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
+#include "torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h"
+#include <c10/core/DeviceGuard.h>
+#include <c10/util/Logging.h>
+#include <c10/util/llvmMathExtras.h>
 
 #include "torch_npu/csrc/core/npu/PythonGilBridge.h"
 
@@ -30,8 +30,8 @@
 #include <ATen/core/CachingHostAllocator.h>
 #include <c10/util/flat_hash_map.h>
 
-#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUAllocatorConfig.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 
 using Block = at::HostBlock<c10_npu::NPUStream>;
 
@@ -242,8 +242,10 @@ struct NPUCachingHostAllocatorImpl
         va_feature_support = false;
         if (pinned_mem_register) {
           TORCH_NPU_WARN_ONCE(
-              "The pinned_mem_register configuration does not take effect, the current driver version does not support this feature."
-              "To use this feature, you need to upgrade to version 25.5.0 or higher");
+              "The pinned_mem_register configuration does not take effect, the "
+              "current driver version does not support this feature."
+              "To use this feature, you need to upgrade to version 25.5.0 or "
+              "higher");
         }
         NPU_CHECK_ERROR(aclrtMallocHost(ptr, size), "aclrtMallocHost");
       } else {
@@ -396,7 +398,8 @@ struct ExpandableSegment {
 
     NPU_CHECK_ERROR(c10_npu::acl::AclrtReserveMemAddress(&ptr_, segment_size_ * max_handles_, 0, nullptr, 1, nullptr));
     ASCEND_LOGD(
-        "NPUExpandableHostAllocator malloc by AclrtReserveMemAddress: size=%zu, segment_size=%zu",
+        "NPUExpandableHostAllocator malloc by AclrtReserveMemAddress: "
+        "size=%zu, segment_size=%zu",
         segment_size_ * max_handles_,
         segment_size_);
   }
@@ -593,20 +596,23 @@ struct NPUExpandableHostAllocatorImpl : public NPUCachingHostAllocatorImpl {
     bool block_found = get_free_expandable_block(params) || alloc_block(params);
     if (!block_found) {
       ASCEND_LOGE(
-          "Get a block from the existing pool failed. Try to free cached blocks and reallocate. This error log can be ignored.");
+          "Get a block from the existing pool failed. Try to free cached "
+          "blocks and reallocate. This error log can be ignored.");
       block_found = release_cached_blocks() && alloc_block(params);
     }
 
     if (!block_found) {
       if (params.err == ACL_ERROR_RT_MEMORY_ALLOCATION) {
         AT_ERROR(
-            "Malloc pin memory failed, host out of memory, Rried to allocate size: ",
+            "Malloc pin memory failed, host out of memory, Rried to "
+            "allocate size: ",
             orig_size,
             ", total_allocated_memory: ",
             stats.active_bytes.current,
             ", total_reserved_memory: ",
             stats.allocated_bytes.current,
-            ". You might be able to retry after freeing up memory using torch_npu.npu.host_empty_cache().");
+            ". You might be able to retry after freeing up memory using "
+            "torch_npu.npu.host_empty_cache().");
       }
       return {nullptr, nullptr};
     }

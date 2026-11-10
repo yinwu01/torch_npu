@@ -1,32 +1,79 @@
+#include "torch_npu/csrc/core/npu/NPUFunctions.h"
+#include "torch_npu/csrc/core/npu/GetCANNInfo.h"
+#include "torch_npu/csrc/core/npu/NPUAffinityController.h"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NpuVariables.h"
+#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
+#include "torch_npu/csrc/framework/interface/EnvVariables.h"
+#include <ATen/Context.h>
+#include <acl/acl_rt.h>
 #include <atomic>
+#include <bitset>
 #include <cstdio>
 #include <cstdlib>
+#include <array>
+#include <atomic>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <unistd.h>
-#include <bitset>
 #include <unordered_map>
 #include <vector>
-#include <ATen/Context.h>
-#include "torch_npu/csrc/core/npu/NPUFunctions.h"
-#include "torch_npu/csrc/core/npu/NpuVariables.h"
-#include "torch_npu/csrc/core/npu/NPUStream.h"
-#include "torch_npu/csrc/core/npu/NPUAffinityController.h"
-#include "torch_npu/csrc/core/npu/register/OptionsManager.h"
-#include "torch_npu/csrc/core/npu/GetCANNInfo.h"
-#include "torch_npu/csrc/framework/interface/EnvVariables.h"
-#include <acl/acl_rt.h>
 #ifndef BUILD_LIBTORCH
 #include "torch_npu/csrc/sanitizer/NPUTrace.h"
 #endif
 
 namespace c10_npu {
 
-static uint32_t dev_count = 0;
+static std::atomic<uint32_t> dev_count{0};
 static thread_local int local_device = -1;
 static std::unordered_map<int8_t, aclrtContext> used_devices;
 std::recursive_mutex mtx;
+
+// This is a positive-result cache of used_devices, not a context lifetime
+// lease. All writers and reset guards hold mtx. The 64-bit epoch is odd during
+// reset; readers validate it twice so they cannot accept a cache entry across
+// reset.
+static std::array<std::atomic<uint8_t>, C10_COMPILE_TIME_MAX_NPUS> active_context{};
+static std::atomic<uint64_t> context_reset_epoch{0};
+static uint32_t context_reset_depth = 0; // Protected by recursive mtx.
+
+inline void clear_context_cache() noexcept {
+  for (auto& active : active_context) {
+    active.store(0, std::memory_order_release);
+  }
+}
+
+inline void mark_context_active(int32_t device, bool active) noexcept {
+  // A reentrant ACL callback can query/register contexts while reset holds
+  // recursive mtx. Preserve the map result but do not republish the cache.
+  if (context_reset_depth == 0 && device >= 0 && device < C10_COMPILE_TIME_MAX_NPUS) {
+    active_context[device].store(active ? 1 : 0, std::memory_order_release);
+  }
+}
+
+class ContextResetGuard {
+ public:
+  // Caller must already hold mtx. Nested scopes keep the outer reset odd.
+  ContextResetGuard() noexcept {
+    if (context_reset_depth++ == 0) {
+      context_reset_epoch.fetch_add(1, std::memory_order_acq_rel);
+      clear_context_cache();
+    }
+  }
+
+  ~ContextResetGuard() noexcept {
+    if (--context_reset_depth == 0) {
+      // Covers successful clear, early ACL error, and exception exits.
+      // On failure the original map is retained and rebuilt lazily.
+      clear_context_cache();
+      context_reset_epoch.fetch_add(1, std::memory_order_release);
+    }
+  }
+
+  ContextResetGuard(const ContextResetGuard&) = delete;
+  ContextResetGuard& operator=(const ContextResetGuard&) = delete;
+};
 thread_local int targetDeviceIndex = -1;
 static std::atomic<uint32_t> deterministic_level = {0};
 static std::mutex deterministic_state_mutex;
@@ -130,8 +177,10 @@ const DeterministicLevel3VersionCheck& GetDeterministicLevel3VersionCheck() {
 void ThrowLevel3UnsupportedError() {
   const auto& check = GetDeterministicLevel3VersionCheck();
   std::ostringstream oss;
-  oss << "'torch_npu.npu.set_deterministic_level(3)' requires CANN runtime and operator packages "
-      << "that support batch consistency. Please upgrade CANN runtime and operator packages.";
+  oss << "'torch_npu.npu.set_deterministic_level(3)' requires CANN runtime and "
+         "operator packages "
+      << "that support batch consistency. Please upgrade CANN runtime and "
+         "operator packages.";
   if (!check.failures.empty()) {
     oss << " Unsatisfied versions:";
     for (const auto& failure : check.failures) {
@@ -156,17 +205,24 @@ bool is_lazy_set_device() {
 }
 
 c10::DeviceIndex device_count() noexcept {
-  // initialize number of devices only once
-  if (dev_count == 0) {
-    aclError error = aclrtGetDeviceCount(&dev_count);
+  uint32_t count = dev_count.load(std::memory_order_acquire);
+  if (count == 0) {
+    uint32_t discovered_count = 0;
+    aclError error = aclrtGetDeviceCount(&discovered_count);
     if (error != ACL_ERROR_NONE) {
       CHECK_AND_THROW_ERROR_WITH_SPECIFIC_MESSAGE(error);
       ASCEND_LOGE("get device count of NPU failed");
       return 0;
     }
-    return static_cast<c10::DeviceIndex>(dev_count);
+    uint32_t expected_count = 0;
+    if (dev_count.compare_exchange_strong(
+            expected_count, discovered_count, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      count = discovered_count;
+    } else {
+      count = expected_count;
+    }
   }
-  return static_cast<c10::DeviceIndex>(dev_count);
+  return static_cast<c10::DeviceIndex>(count);
 }
 
 bool hasPrimaryContext(c10::DeviceIndex device_index) {
@@ -267,6 +323,7 @@ aclError SetDevice(c10::DeviceIndex device) {
     std::lock_guard<std::recursive_mutex> lock(mtx);
     if (used_devices.find(local_device) == used_devices.end()) {
       NPU_CHECK_ERROR_WITHOUT_UCE(aclrtGetCurrentContext(&used_devices[local_device]));
+      mark_context_active(local_device, used_devices[local_device] != nullptr);
     }
     SetDeviceResLimitFromEnv(local_device);
   }
@@ -277,7 +334,10 @@ aclError MaybeSetDevice(c10::DeviceIndex device) {
   if (isDeviceCtxActive(device)) {
     NPU_CHECK_ERROR_WITHOUT_UCE(SetDevice(device));
   } else {
-    ASCEND_LOGI("MaybeSetDevice: NPU device %d has not been initialized! We will set targetDeviceIndex.", device);
+    ASCEND_LOGI(
+        "MaybeSetDevice: NPU device %d has not been initialized! We "
+        "will set targetDeviceIndex.",
+        device);
     targetDeviceIndex = device;
   }
   return ACL_ERROR_NONE;
@@ -294,6 +354,7 @@ std::vector<int8_t> GetUsedDevices() {
 
 aclError ResetUsedDevices() {
   std::lock_guard<std::recursive_mutex> lock(mtx);
+  ContextResetGuard reset_guard;
   for (const auto it : used_devices) {
     aclError err = aclrtResetDevice(it.first);
     if (err != ACL_ERROR_NONE) {
@@ -311,8 +372,11 @@ aclError DestroyUsedStreams() {
   for (const auto it : used_devices) {
     if (c10_npu::StreamInitFlag(it.first)) {
       NPU_CHECK_ERROR_WITHOUT_UCE(SetDevice(it.first));
-      NPUStream stream = getCurrentNPUStream(it.first);
-      aclError acl_ret = acl::AclrtDestroyStreamForce(stream.stream(false));
+      aclrtStream stream = getCurrentNPUStreamNoInit(it.first);
+      if (stream == nullptr) {
+        continue;
+      }
+      aclError acl_ret = acl::AclrtDestroyStreamForce(stream);
       if (acl_ret != ACL_ERROR_NONE) {
         return acl_ret;
       }
@@ -357,11 +421,23 @@ bool isDeviceCtxActive(int32_t device) {
   if (at_npu::native::env::CheckCompatibleImpl()) {
     return hasPrimaryContext(device);
   }
-  std::lock_guard<std::recursive_mutex> lock(mtx);
-  if (used_devices.find(device) == used_devices.end()) {
-    return false;
+  const bool cacheable = device >= 0 && device < C10_COMPILE_TIME_MAX_NPUS;
+  if (cacheable) {
+    const auto epoch = context_reset_epoch.load(std::memory_order_acquire);
+    if ((epoch & 1) == 0 && active_context[device].load(std::memory_order_acquire) != 0 &&
+        context_reset_epoch.load(std::memory_order_acquire) == epoch) {
+      return true;
+    }
   }
-  return used_devices[device] != nullptr;
+  std::lock_guard<std::recursive_mutex> lock(mtx);
+  // Keep the original int32_t-to-int8_t map-key conversion for every input,
+  // including indices outside the bounded cache. Do not reject them here.
+  const auto it = used_devices.find(device);
+  const bool active = it != used_devices.end() && it->second != nullptr;
+  if (cacheable) {
+    mark_context_active(device, active);
+  }
+  return active;
 }
 
 std::optional<c10::DeviceIndex> getDeviceIndexWithPrimaryContext() {
@@ -419,7 +495,10 @@ int MaybeExchangeDevice(int to_device) {
   if (isDeviceCtxActive(to_device)) {
     NPU_CHECK_ERROR_WITHOUT_UCE(SetDevice(to_device));
   } else {
-    ASCEND_LOGI("NPU device %d has not been initialized! We will set targetDeviceIndex.", to_device);
+    ASCEND_LOGI(
+        "NPU device %d has not been initialized! We will set "
+        "targetDeviceIndex.",
+        to_device);
     targetDeviceIndex = to_device;
   }
   return cur_device;
@@ -466,6 +545,7 @@ void LazySetDevice(c10::DeviceIndex device) {
       std::lock_guard<std::recursive_mutex> lock(mtx);
       if (used_devices.find(local_device) == used_devices.end()) {
         NPU_CHECK_ERROR_WITHOUT_UCE(aclrtGetCurrentContext(&used_devices[local_device]));
+        mark_context_active(local_device, used_devices[local_device] != nullptr);
       }
       SetDeviceResLimitFromEnv(local_device);
     }

@@ -1,16 +1,19 @@
 #pragma once
 
+#include "c10/macros/Export.h"
+#include "torch_npu/csrc/core/npu/NPUEventManager.h"
+#include "torch_npu/csrc/core/npu/NPUMacros.h"
+#include "torch_npu/csrc/core/npu/npu_log.h"
+#include "torch_npu/csrc/core/npu/register/OptionRegister.h"
 #include <acl/acl.h>
+#include <atomic>
+#include <condition_variable>
+#include <exception>
+#include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <functional>
-#include <mutex>
-#include "c10/macros/Export.h"
-#include "torch_npu/csrc/core/npu/npu_log.h"
-#include "torch_npu/csrc/core/npu/NPUMacros.h"
-#include "torch_npu/csrc/core/npu/NPUEventManager.h"
-#include "torch_npu/csrc/core/npu/register/OptionRegister.h"
 #define NpuSysStatus c10_npu::NpuSysCtrl::SysStatus
 
 namespace c10_npu {
@@ -71,20 +74,29 @@ class NpuSysCtrl {
   void RegisterReleaseFn(ReleaseFn release_fn, ReleasePriority priority = ReleasePriority::PriorityMiddle);
 
  private:
+  enum class RuntimeLifecycle : uint8_t {
+    Uninitialized,
+    Initializing,
+    Running,
+    Finalizing,
+    Failed,
+  };
+
   NpuSysCtrl();
 
  private:
   bool repeat_init_acl_flag_;
-  bool init_flag_;
-  bool lazy_init_flag_;
-  bool host_finalize_flag_; // during shutdown, we need to tell hostallocator
-                            // empty_cache to avoid stream lifetime issues,
-                            // mutex not needed
-  int device_id_;
+  std::atomic<bool> init_flag_{false};
+  std::atomic<bool> lazy_init_flag_{false};
+  std::atomic<bool> host_finalize_flag_{false}; // during shutdown, tell hostallocator empty_cache to avoid stream
+                                                // lifetime issues
+  std::atomic<int> device_id_{0};
   std::map<ReleasePriority, std::vector<ReleaseFn>> release_fn_;
   std::vector<std::pair<option::OptionCallBack, std::string>> lazy_fn_;
+  RuntimeLifecycle lifecycle_{RuntimeLifecycle::Uninitialized};
+  std::exception_ptr initialization_error_;
   std::mutex init_mutex_;
-  std::mutex lazy_init_mutex_;
+  std::condition_variable lifecycle_cv_;
 };
 
 aclError SetCurrentDevice();

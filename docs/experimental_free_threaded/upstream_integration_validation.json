@@ -1,0 +1,183 @@
+{
+  "upstream_base": "0d167b0302cbaca25f793a61562dd8f78098d257",
+  "ported_commits": [
+    "7d45a86cd1fdf70d8177445f0c79268cc75c7516",
+    "d3216c2359a1753ec05a95f6ed0517f92677238f"
+  ],
+  "platform": "Windows x86_64; Zig C++17 compiler; bundled CPython",
+  "host_region_python_tests": {
+    "passed": 42,
+    "scope": "fake native boundary; no NPU"
+  },
+  "overlay_tool_tests": {
+    "passed": 9,
+    "scope": "temporary Git repositories; not current op-plugin device qualification"
+  },
+  "native_queue_tests": [
+    {
+      "case": "capacity-rejected",
+      "code": 0,
+      "stdout": "PASS capacity-rejected\n",
+      "stderr": ""
+    },
+    {
+      "case": "claimed-last-drain",
+      "code": 0,
+      "stdout": "PASS claimed-last-drain\n",
+      "stderr": ""
+    },
+    {
+      "case": "inspect-gate-consumer",
+      "code": 0,
+      "stdout": "PASS inspect-gate-consumer\n",
+      "stderr": ""
+    },
+    {
+      "case": "failed-consumer-drain",
+      "code": 0,
+      "stdout": "PASS failed-consumer-drain\n",
+      "stderr": ""
+    },
+    {
+      "case": "producer-before-wait-throws",
+      "code": 0,
+      "stdout": "PASS producer-before-wait-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "producer-after-wait-throws",
+      "code": 0,
+      "stdout": "PASS producer-after-wait-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "consumer-before-wait-throws",
+      "code": 0,
+      "stdout": "PASS consumer-before-wait-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "consumer-after-wait-throws",
+      "code": 0,
+      "stdout": "PASS consumer-after-wait-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "stop-full",
+      "code": 0,
+      "stdout": "PASS stop-full\n",
+      "stderr": ""
+    },
+    {
+      "case": "copy-throws",
+      "code": 0,
+      "stdout": "PASS copy-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "discard",
+      "code": 0,
+      "stdout": "PASS discard\n",
+      "stderr": ""
+    },
+    {
+      "case": "discard-throws",
+      "code": 0,
+      "stdout": "PASS discard-throws\n",
+      "stderr": ""
+    },
+    {
+      "case": "restart",
+      "code": 0,
+      "stdout": "PASS restart\n",
+      "stderr": ""
+    },
+    {
+      "case": "stress-2",
+      "code": 0,
+      "stdout": "PASS stress-2\n",
+      "stderr": ""
+    },
+    {
+      "case": "stress-8",
+      "code": 0,
+      "stdout": "PASS stress-8\n",
+      "stderr": ""
+    },
+    {
+      "case": "stress-64",
+      "code": 0,
+      "stdout": "PASS stress-64\n",
+      "stderr": ""
+    },
+    {
+      "case": "stress-4096",
+      "code": 0,
+      "stdout": "PASS stress-4096\n",
+      "stderr": ""
+    },
+    {
+      "case": "ordered-core-correctness",
+      "code": 0,
+      "stdout": "all ordered MPSC queue tests passed\n",
+      "stderr": ""
+    },
+    {
+      "case": "wake-contract",
+      "code": 0,
+      "stdout": "{\"test\":\"running_nonempty_drain_wake_contract\",\"waiters\":8,\"items\":64,\"nonempty_consume_steps\":63,\"step_interval_ms\":2,\"nonempty_wait_entries\":8,\"repeated_wait_entries_while_nonempty\":0,\"allowed_spurious_rewaits\":32,\"waiters_completed_after_final_consume\":8,\"early_drain_returns\":0,\"infrastructure_ok\":true,\"contract_passed\":true}\n",
+      "stderr": ""
+    },
+    {
+      "case": "metadata-lifecycle",
+      "code": 0,
+      "stdout": "{\"test\":\"StopAndDiscardMetadata_consumer_idle_with_pending_items\",\"queued_before_callback_release\":3,\"consumer_steps\":1,\"remaining_items_after_single_consume\":2,\"discard_callbacks\":0,\"wait_before\":1,\"wait_after\":1,\"rescue_request_stop\":false,\"bounded_cleanup_complete\":true,\"passed\":true}\n",
+      "stderr": ""
+    },
+    {
+      "case": "discard-lifecycle",
+      "code": 0,
+      "stdout": "{\"test\":\"StopAndDiscard_consumer_idle_with_pending_items\",\"queued_before_callback_release\":3,\"consumer_steps\":1,\"remaining_items_after_single_consume\":2,\"discard_callbacks\":2,\"wait_before\":1,\"wait_after\":1,\"rescue_request_stop\":false,\"bounded_cleanup_complete\":true,\"passed\":true}\n",
+      "stderr": ""
+    }
+  ],
+  "python_syntax_checked": [
+    "benchmarks/host_regions/measurement_contracts_r22.py",
+    "benchmarks/host_regions/real_dlrm_runner_r22.py",
+    "benchmarks/host_regions/run_real_measurement_r22.py",
+    "setup.py",
+    "test/cpp/experimental_free_threaded/run_candidate.py",
+    "test/host_regions/test_apply_op_plugin_overlay.py",
+    "test/host_regions/test_native_close_retirement_r22.py",
+    "test/host_regions/test_native_submit_lifetime_r22.py",
+    "test/host_regions/test_real_provider_r22.py",
+    "tools/host_regions/apply_op_plugin_overlay.py",
+    "torch_npu/__init__.py",
+    "torch_npu/_host_regions/__init__.py",
+    "torch_npu/_host_regions/backends.py",
+    "torch_npu/_host_regions/contracts.py",
+    "torch_npu/_host_regions/frontend.py",
+    "torch_npu/_host_regions/integration.py",
+    "torch_npu/_host_regions/runtime.py",
+    "torch_npu/_host_regions/torch_npu_policy.py",
+    "torch_npu/_host_regions/torch_npu_provider.py",
+    "torch_npu/_inductor/ascend_npu_ir/ascend_npu_ir/npu/codegen/cpp_wrapper.py",
+    "torch_npu/_inductor/ascend_npu_ir/ascend_npu_ir/npu/mlir_compiler.py",
+    "torch_npu/npu/__init__.py"
+  ],
+  "source_sha256": {
+    "torch_npu/csrc/core/npu/NPUQueue.cpp": "b1474acc9755ca3b7079b7c2d05aad2304aee4dc51a7a78835208961b46dc2ca",
+    "torch_npu/csrc/core/npu/OrderedMpscQueueCore.h": "49334fe4afb07fd4a8c504e00e0f664c5e2a2c23500c465e54295148437d007a",
+    "torch_npu/csrc/core/npu/ExperimentalSequenceMpscQueueCore.h": "a0c178a3ee62e1149a8c8eb96a79ef534f8f328bc093e98e29703585f19bd6a6",
+    "torch_npu/csrc/core/npu/HostRegionCapture.cpp": "6f28a566958908b7bbe1a20e3606f937b7d82f8776dff5d36f23c31fe9816352"
+  },
+  "not_verified": [
+    "Full Linux adapter build",
+    "NPU execution",
+    "Profiler upload Linux tests on this combination",
+    "Sanitizers",
+    "Rebased op-plugin owned-OpAPI overlay"
+  ],
+  "current_op_plugin": "eee88cf400f796c150db5a6203c4218b5af7ea18",
+  "historical_overlay_base": "312921458e7d396c54a1e92e90385d7d5f02dede"
+}

@@ -1,3 +1,4 @@
+#include "torch_npu/csrc/core/npu/PrefixH2DPrewait.h"
 // Copyright (c) 2023 Huawei Technologies Co., Ltd
 // Copyright (c) 2023, Facebook CORPORATION.
 // All rights reserved.
@@ -14,22 +15,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "third_party/op-plugin/op_plugin/utils/op_api_common.h"
+#include "torch_npu/csrc/aten/CustomFunctions.h"
+#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
+#include "torch_npu/csrc/aten/NPUOpApiNativeFunctions.h"
+#include "torch_npu/csrc/aten/common/FormatCastHelper.h"
+#include "torch_npu/csrc/aten/common/InnerNpuNativeFunction.h"
+#include "torch_npu/csrc/core/npu/CachingHostAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUPeerToPeerAccess.h"
 #include "torch_npu/csrc/core/npu/NpuVariables.h"
-#include "torch_npu/csrc/framework/utils/CalcuOpUtil.h"
-#include "torch_npu/csrc/framework/utils/NpuUtils.h"
-#include "torch_npu/csrc/framework/contiguous/ContiguousOpt.h"
-#include "torch_npu/csrc/aten/CustomFunctions.h"
-#include "torch_npu/csrc/aten/common/InnerNpuNativeFunction.h"
-#include "torch_npu/csrc/core/npu/CachingHostAllocator.h"
 #include "torch_npu/csrc/custom_dtype/CustomDType.h"
-#include "torch_npu/csrc/aten/NPUOpApiNativeFunctions.h"
-#include "torch_npu/csrc/aten/NPUNativeFunctions.h"
 #include "torch_npu/csrc/framework/FormatHelper.h"
 #include "torch_npu/csrc/framework/StorageDescHelper.h"
-#include "torch_npu/csrc/aten/common/FormatCastHelper.h"
-#include "third_party/op-plugin/op_plugin/utils/op_api_common.h"
+#include "torch_npu/csrc/framework/contiguous/ContiguousOpt.h"
+#include "torch_npu/csrc/framework/utils/CalcuOpUtil.h"
+#include "torch_npu/csrc/framework/utils/NpuUtils.h"
 #ifndef BUILD_LIBTORCH
 #include "torch_npu/csrc/sanitizer/NPUTrace.h"
 #endif
@@ -79,7 +80,10 @@ void copy_between_host_and_device_opapi(
     void* currentPtr = torch_npu::utils::is_npu(dst) ? src.data_ptr() : dst.data_ptr();
     process_non_blocking_copy(storage, currentPtr, stream, kind);
   } else {
-    aclError error = aclrtSynchronizeStream(stream);
+    aclError error = ACL_ERROR_NONE;
+    if (!(kind == aclrtMemcpyKind::ACL_MEMCPY_HOST_TO_DEVICE && c10_npu::prefix::TryH2DPrewait(stream))) {
+      error = aclrtSynchronizeStream(stream);
+    }
     auto ret = CalcuOpUtil::AclrtMemcpyWithModeSwitch(
         std::make_pair(dst.storage().unsafeGetStorageImpl(), dst.storage_offset() * dst.itemsize()),
         nbytes,
@@ -249,9 +253,12 @@ at::Tensor& NPUNativeOpApiFunctions::copy_(at::Tensor& self, const at::Tensor& s
         can_use_memcpy(self, src);
     TORCH_CHECK(
         !torch_npu::utils::is_npu(self) || use_nz_memcpy,
-        "The copy_ operator with internal format tensors is not supported on Ascend950, "
-        "except for device-to-host copies and same-device copies between contiguous, non-view NZ tensors "
-        "with the same dtype, matching shapes/storage descriptions, zero storage offsets, "
+        "The copy_ operator with internal format tensors is not "
+        "supported on Ascend950, "
+        "except for device-to-host copies and same-device copies "
+        "between contiguous, non-view NZ tensors "
+        "with the same dtype, matching shapes/storage descriptions, "
+        "zero storage offsets, "
         "and tensor metadata matching their storage base metadata",
         OPS_ERROR(ErrCode::NOT_SUPPORT));
   }

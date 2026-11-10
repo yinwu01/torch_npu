@@ -1,15 +1,19 @@
 #ifndef __PULGIN_NATIVE_UTILS_OP_COMMAND__
 #define __PULGIN_NATIVE_UTILS_OP_COMMAND__
 
-#include "torch_npu/csrc/core/npu/NPUMacros.h"
-#include "torch_npu/csrc/framework/OpParamMaker.h"
-#include "torch_npu/csrc/framework/FormatHelper.h"
 #include "torch_npu/csrc/aten/NPUNativeFunctions.h"
 #include "torch_npu/csrc/aten/mirror/NPUTensorIterator.h"
+#include "torch_npu/csrc/core/npu/NPUMacros.h"
+#include "torch_npu/csrc/framework/FormatHelper.h"
+#include "torch_npu/csrc/framework/OpParamMaker.h"
 #include "torch_npu/csrc/framework/utils/CalcuOpUtil.h"
-#include "torch_npu/csrc/framework/utils/NpuUtils.h"
 #include "torch_npu/csrc/framework/utils/NPUDefinition.h"
+#include "torch_npu/csrc/framework/utils/NpuUtils.h"
 
+#include <memory>
+namespace c10_npu::host_regions {
+class OwnedOpApiPayload;
+}
 extern std::atomic<bool> g_used_aclop;
 
 namespace at_npu {
@@ -132,6 +136,7 @@ class TORCH_NPU_API OpCommand {
 
   OpCommand& Sync();
 
+  static void RunOwnedOpApi(const string& op_name, std::unique_ptr<c10_npu::host_regions::OwnedOpApiPayload> payload);
   static void RunOpApi(const string& op_name, PROC_FUNC func, bool sync = false);
   static void RunOpApiV2(const string& op_name, const PROC_FUNC& func, bool sync = false);
   static void RunOpApiV3(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 #include <mutex>
 #include <c10/core/DeviceGuard.h>
 #include <c10/core/Stream.h>
@@ -113,6 +114,8 @@ C10_NPU_API NPUStream getNPUStreamFromPool(c10::DeviceIndex device = -1);
 
 C10_NPU_API NPUStream getDefaultNPUStream(c10::DeviceIndex device_index = -1);
 
+aclrtStream getCurrentNPUStreamNoInit(c10::DeviceIndex device_index);
+
 C10_NPU_API NPUStream getStreamFromExternal(aclrtStream stream, c10::DeviceIndex device_index);
 
 C10_NPU_API NPUStream getStreamFromPool(const bool isHighPriority, c10::DeviceIndex device_index);
@@ -134,6 +137,9 @@ void setDefaultStreamsStatus(c10::DeviceIndex device_index, RepoStatus status);
 C10_NPU_API bool npuSynchronizeDevice(bool check_error = true);
 
 void enCurrentNPUStream(void* cur_paras, c10::DeviceIndex device_index = -1, NPUStream* task_stream = nullptr);
+
+void enCurrentNPUStreamBatch(void* const* items, size_t count, c10::DeviceIndex device_index,
+    void (*prepare)(size_t, void*), void* context);
 
 C10_NPU_EXPORT bool npuSynchronizeUsedDevices(bool check_error = true);
 

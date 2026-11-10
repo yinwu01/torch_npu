@@ -5,8 +5,8 @@
 #include "torch_npu/csrc/core/npu/NPUException.h"
 #include "torch_npu/csrc/core/npu/NpuVariables.h"
 #include "torch_npu/csrc/core/npu/register/OptionRegister.h"
-#include "torch_npu/csrc/framework/interface/AclOpCompileInterface.h"
 #include "torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.h"
+#include "torch_npu/csrc/framework/interface/AclOpCompileInterface.h"
 
 #include "torch_npu/csrc/core/npu/PythonGilBridge.h"
 #include <atomic>
@@ -15,12 +15,12 @@
 #define GetCurrentDirPath _getcwd
 #define Mkdir(path, mode) _mkdir(path)
 #elif defined(__unix__)
+#include <mutex>
+#include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <mutex>
 #include <vector>
-#include <string>
 #define GetCurrentDirPath getcwd
 #define Mkdir(path, mode) mkdir(path, mode)
 #else
@@ -245,7 +245,8 @@ void LazyInitAclops() {
   }
   TORCH_CHECK(
       acl_op_init_mode != 2,
-      "Acl op is disabled! Please check the environment variable ACL_OP_INIT_MODE.",
+      "Acl op is disabled! Please check the environment variable "
+      "ACL_OP_INIT_MODE.",
       PTA_ERROR(ErrCode::NOT_SUPPORT));
 
   if (!encounteredAclops.exchange(true) && c10_npu::NpuSysCtrl::GetInstance().GetInitFlag()) {

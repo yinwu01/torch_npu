@@ -11,6 +11,10 @@ else()
 endif()
 
 project(TORCHNPU CXX C)
+option(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE "Use experimental sequence-ring queue" OFF)
+if(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE)
+  add_compile_definitions(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE)
+endif()
 add_compile_options(-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
@@ -56,9 +60,13 @@ SET(CMAKE_CXX_FLAGS_RELEASE "-O2")
 SET(CMAKE_CXX_FLAGS_DEBUG "-O0 -g")
 
 option(USE_NPU "Use NPU" ON)
-option(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE "Enable the experimental sequence MPSC task queue (full rebuild required)" OFF)
-if(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE)
-  add_compile_definitions(TORCH_NPU_EXPERIMENTAL_LOCKFREE_QUEUE)
+option(
+  TORCH_NPU_EXPERIMENTAL_FREE_THREADED
+  "Declare TorchNPU extensions no-GIL for controlled experiments"
+  OFF
+)
+if(TORCH_NPU_EXPERIMENTAL_FREE_THREADED)
+  add_compile_definitions(TORCH_NPU_EXPERIMENTAL_FREE_THREADED=1)
 endif()
 
 # LTO&PGO optimization in compile option

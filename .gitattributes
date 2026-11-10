@@ -1,0 +1,8 @@
+# Preserve the historical op-plugin overlay bytes used by its SHA-256 manifest.
+patches/host_regions/op-plugin/op_plugin/utils/op_api_common.cpp -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_common.h -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_common_base.h -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_owned_pack_r22.h -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_owned_payload_r22.h -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_owned_r22.h -text whitespace=trailing-space,space-before-tab,cr-at-eol
+patches/host_regions/op-plugin/op_plugin/utils/op_api_sdk_profile_r22.h -text whitespace=trailing-space,space-before-tab,cr-at-eol

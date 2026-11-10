@@ -15,6 +15,7 @@
 #include "torch_npu/csrc/core/npu/npu_log.h"
 #include "torch_npu/csrc/core/npu/NpuVariables.h"
 #include "torch_npu/csrc/core/npu/register/OptionRegister.h"
+namespace c10_npu::option { c10::optional<std::string> GetOptionFast(const char*); }
 #include "torch_npu/csrc/framework/LazyInitAclops.h"
 #include "torch_npu/csrc/framework/interface/EnvVariables.h"
 namespace at_npu {
@@ -285,13 +286,21 @@ TORCH_NPU_REGISTER_OPTION(MM_BMM_ND_ENABLE)
 REGISTER_OPTION_BOOL_FUNCTION_UNIQ(CheckMmBmmNDDisable, MM_BMM_ND_ENABLE, "enable", "disable")
 
 TORCH_NPU_REGISTER_OPTION(ALLOW_INTERNAL_FORMAT)
-REGISTER_OPTION_BOOL_FUNCTION(CheckForbidInternalFormat, ALLOW_INTERNAL_FORMAT, "enable", "disable")
+bool CheckForbidInternalFormat()
+{
+    auto val = c10_npu::option::GetOptionFast("ALLOW_INTERNAL_FORMAT");
+    return val.value_or("enable") == "disable";
+}
 
 TORCH_NPU_REGISTER_OPTION(STRONG_CONSISTENCY)
 REGISTER_OPTION_BOOL_FUNCTION(CheckStrongConsistency, STRONG_CONSISTENCY, "disable", "enable")
 
 REGISTER_OPTION_INIT_BY_ENV(TORCH_NPU_USE_COMPATIBLE_IMPL)
-REGISTER_OPTION_BOOL_FUNCTION(CheckCompatibleImpl, TORCH_NPU_USE_COMPATIBLE_IMPL, "0", "1")
+bool CheckCompatibleImpl()
+{
+    auto val = c10_npu::option::GetOptionFast("TORCH_NPU_USE_COMPATIBLE_IMPL");
+    return val.value_or("0") == "1";
+}
 
 static const CompatibleConfig& GetCompatibleConfig() {
   static const CompatibleConfig compatible_config = InitCompatibleConfig();
