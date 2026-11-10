@@ -1,5 +1,43 @@
 # Experimental sequence task queues
 
+## Upstream integration snapshot
+
+This branch starts at Ascend/pytorch master commit
+`0d167b0302cbaca25f793a61562dd8f78098d257` and incorporates PR #184 commit
+`d538cb535626c2ba8e26541dfbd19f3cc85e4d10`. It keeps upstream's Python
+tracer unchanged, including its per-thread caches and callback shutdown.
+
+Only the profiler RingBuffer, DataDumper and TraceDataDumper fixes are
+ported from `fix/profiler-thread-safety` at
+`82831f4486e7c5973b5b895cf5ff6690410dcaaf`. The old Python tracer changes
+and the fork's host-region extensions are not part of this branch.
+
+The PR adapter is adjusted for current upstream: GIL waits use PythonGilBridge,
+and the release worker starts lazily for aclop tasks. If worker creation fails,
+parameter release falls back to the upstream synchronous path. The queue core
+and its standalone tests remain identical to the PR.
+
+Source comparisons and whitespace/conflict checks are the only validation
+performed on the Windows integration host. C++ compilation, sanitizer runs,
+and Linux/NPU validation are pending. No earlier branch's test results qualify
+this new combination. Keep the experimental option OFF until it is validated.
+
+The upload-path regression tests compile the actual ring buffer, dumper and
+Linux Thread implementation, with stubs only for reporting and file/log helpers.
+They do not validate the upstream Python tracer or real reporting encoders:
+
+```sh
+cmake -S test/cpp/profiler_thread_safety -B build/profiler-upload -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build/profiler-upload --parallel 2
+ctest --test-dir build/profiler-upload --output-on-failure
+```
+
+Repeat in fresh build directories with `-DPROFILER_SANITIZER=thread` and
+`-DPROFILER_SANITIZER=address`. Also run the queue core tests below. Full builds
+with the experimental option OFF and ON must both be tested on the target NPU
+with repeated profiler sessions, multiple producers, and with_stack workloads
+on the actual Python/PyTorch/CANN combination.
+
 The opt-in bounded MPSC queue uses per-slot sequence numbers for producer
 payload transfer, allowing producers to copy into independently reserved slots
 without the old enqueue transfer mutex. Repository still executes one task at a time;
